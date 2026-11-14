@@ -14,12 +14,11 @@ import {
   LogIn,
   UploadCloud,
   Download,
-  Copy,
-  Check,
   Calendar,
   Pencil,
   X,
   RotateCcw,
+  User,
 } from 'lucide-react';
 import { BikeSettings, MaintenanceItem, DailyLog, UnexpectedExpense } from './types';
 import {
@@ -40,68 +39,12 @@ import {
   ensureValidUuid,
   sortDailyLogsDesc,
 } from './calculations';
-import {
-  getSupabaseClient,
-  getSupabaseCredentials,
-  saveSupabaseCredentials,
-  clearSupabaseCredentials,
-} from './supabaseClient';
+import { getSupabaseClient, getSupabaseCredentials } from './supabaseClient';
 
 const LS_SETTINGS_KEY = 'motolucro_bike_settings_v1';
 const LS_MAINT_KEY = 'motolucro_maint_items_v1';
 const LS_LOGS_KEY = 'motolucro_daily_logs_v1';
 const LS_UNEXPECTED_KEY = 'motolucro_unexpected_v1';
-
-const SQL_SCHEMA_TEXT = `-- Cole no SQL Editor do Supabase e clique em Run:
-create table if not exists public.bike_settings (
-  user_id uuid primary key references auth.users(id) on delete cascade,
-  bike_name text not null default 'Minha Moto (Tenere)',
-  fuel_consumption_km_l numeric(10,2) not null default 30.00,
-  fuel_price_per_liter numeric(10,2) not null default 5.89,
-  updated_at timestamptz not null default now()
-);
-
-create table if not exists public.maintenance_items (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references auth.users(id) on delete cascade,
-  name text not null,
-  cost numeric(10,2) not null,
-  duration_km numeric(10,2) not null check (duration_km > 0),
-  created_at timestamptz not null default now()
-);
-
-create table if not exists public.daily_logs (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references auth.users(id) on delete cascade,
-  log_date date not null,
-  earnings numeric(10,2) not null default 0,
-  km_start numeric(10,2) not null default 0,
-  km_end numeric(10,2) not null default 0,
-  km_total numeric(10,2) not null default 0,
-  start_time text,
-  end_time text,
-  notes text,
-  created_at timestamptz not null default now()
-);
-
-create table if not exists public.unexpected_expenses (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references auth.users(id) on delete cascade,
-  expense_date date not null,
-  description text not null,
-  amount numeric(10,2) not null,
-  created_at timestamptz not null default now()
-);
-
-alter table public.bike_settings enable row level security;
-alter table public.maintenance_items enable row level security;
-alter table public.daily_logs enable row level security;
-alter table public.unexpected_expenses enable row level security;
-
-create policy "Users manage own bike_settings" on public.bike_settings for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy "Users manage own maintenance_items" on public.maintenance_items for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy "Users manage own daily_logs" on public.daily_logs for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy "Users manage own unexpected_expenses" on public.unexpected_expenses for all using (auth.uid() = user_id) with check (auth.uid() = user_id);`;
 
 type TabType = 'lancar' | 'historico' | 'custos' | 'imprevistos' | 'nuvem';
 
@@ -208,12 +151,8 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [cloudErrorBanner, setCloudErrorBanner] = useState<string>('');
 
-  // Credenciais dinâmicas do Supabase
-  const initialCreds = getSupabaseCredentials();
-  const [sbUrlInput, setSbUrlInput] = useState(initialCreds.url);
-  const [sbKeyInput, setSbKeyInput] = useState(initialCreds.anonKey);
-  const [isSbConfigured, setIsSbConfigured] = useState(initialCreds.isConfigured);
-  const [copiedSql, setCopiedSql] = useState(false);
+  // Credenciais pré-configuradas do Supabase
+  const isSbConfigured = getSupabaseCredentials().isConfigured;
 
   // Formulário de Lançamento Diário Rápido (data em fuso local + KM Inicial preenchido com último KM Final)
   const todayStr = getLocalTodayStr();
@@ -1118,14 +1057,6 @@ export default function App() {
     setAuthStatus('Sessão encerrada. Seus dados continuam salvos no aparelho.');
   }
 
-  function handleSaveCredentials(e: React.FormEvent) {
-    e.preventDefault();
-    if (!sbUrlInput.trim() || !sbKeyInput.trim()) return;
-    saveSupabaseCredentials(sbUrlInput, sbKeyInput);
-    setIsSbConfigured(true);
-    setAuthStatus('Credenciais do Supabase salvas! Agora você pode fazer login ou criar sua conta.');
-  }
-
   function handleExportBackup() {
     const payload = {
       exportedAt: new Date().toISOString(),
@@ -1173,8 +1104,8 @@ export default function App() {
                 : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-800'
             }`}
           >
-            <Cloud className="w-3.5 h-3.5" />
-            {userEmail ? 'Sincronizado' : 'Login / Nuvem'}
+            <User className="w-3.5 h-3.5" />
+            {userEmail ? 'Sincronizado' : 'Minha Conta'}
           </button>
         </div>
       </header>
@@ -2396,20 +2327,31 @@ export default function App() {
           </div>
         )}
 
-        {/* ABA 5: LOGIN SUPABASE & BACKUP NUVEM */}
+        {/* ABA 5: MINHA CONTA (ACESSO, SINCRONIZAÇÃO E RESUMO PERTINENTE) */}
         {activeTab === 'nuvem' && (
           <div className="space-y-5">
+            {/* Card 1: Acesso e Sincronização na Nuvem */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
-              <div className="flex items-center gap-2.5">
-                <Cloud className="w-5 h-5 text-emerald-400" />
-                <div>
-                  <h2 className="text-base font-bold text-white">
-                    Login & Banco de Dados Online (Supabase)
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    Conecte seu projeto Supabase para sincronizar seus lançamentos na nuvem com login seguro e nunca perder dados.
-                  </p>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <User className="w-5 h-5 text-emerald-400" />
+                  <div>
+                    <h2 className="text-base font-bold text-white">Minha Conta</h2>
+                    <p className="text-xs text-slate-400">
+                      Entre na sua conta para manter seus lançamentos sincronizados na nuvem entre celular e computador.
+                    </p>
+                  </div>
                 </div>
+                <span
+                  className={`text-[11px] font-medium px-2.5 py-1 rounded-full border shrink-0 flex items-center gap-1.5 ${
+                    userEmail
+                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                      : 'bg-slate-800 border-slate-700 text-slate-400'
+                  }`}
+                >
+                  <Cloud className="w-3.5 h-3.5" />
+                  {userEmail ? 'Nuvem Ativa' : 'Modo Local'}
+                </span>
               </div>
 
               {authStatus && (
@@ -2421,14 +2363,14 @@ export default function App() {
               {/* Se já estiver logado */}
               {userEmail ? (
                 <div className="space-y-3 bg-slate-950 border border-slate-800 p-4 rounded-xl">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <div>
-                      <span className="text-xs text-slate-400 block">Conectado como:</span>
+                      <span className="text-xs text-slate-400 block">Conta conectada:</span>
                       <span className="text-sm font-bold text-emerald-400">{userEmail}</span>
                     </div>
                     <button
                       onClick={handleLogout}
-                      className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2 rounded-lg"
+                      className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2 rounded-lg transition"
                     >
                       <LogOut className="w-3.5 h-3.5" /> Sair
                     </button>
@@ -2441,7 +2383,7 @@ export default function App() {
                       className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition"
                     >
                       <UploadCloud className="w-4 h-4" />
-                      {syncing ? 'Sincronizando...' : 'Enviar Dados Locais / Planilha para a Nuvem'}
+                      {syncing ? 'Sincronizando...' : 'Sincronizar Dados com a Nuvem'}
                     </button>
 
                     <button
@@ -2504,81 +2446,84 @@ export default function App() {
                       ? 'Aguarde...'
                       : authMode === 'login'
                       ? 'Entrar e Sincronizar'
-                      : 'Criar Conta no Supabase'}
+                      : 'Criar Conta'}
                   </button>
                 </form>
               )}
+            </div>
 
-              {/* Configuração rápida da URL e Key do Supabase */}
-              <form
-                onSubmit={handleSaveCredentials}
-                className="bg-slate-950/60 border border-slate-800/80 p-4 rounded-xl space-y-3"
-              >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                    Conexão do Projeto Supabase (VITE_SUPABASE_URL & ANON_KEY)
-                  </span>
-                  {isSbConfigured && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        clearSupabaseCredentials();
-                        setSbUrlInput('');
-                        setSbKeyInput('');
-                        setIsSbConfigured(false);
-                      }}
-                      className="text-[11px] text-rose-400 hover:underline"
-                    >
-                      Limpar chaves
-                    </button>
-                  )}
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  <input
-                    type="url"
-                    placeholder="https://xyz.supabase.co"
-                    value={sbUrlInput}
-                    onChange={(e) => setSbUrlInput(e.target.value)}
-                    className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 outline-none"
-                  />
-                  <input
-                    type="password"
-                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9... (anon public key)"
-                    value={sbKeyInput}
-                    onChange={(e) => setSbKeyInput(e.target.value)}
-                    className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 outline-none"
-                  />
+            {/* Card 2: Resumo dos Dados & Backup */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-bold text-white">Resumo da Sua Rotina & Moto</h3>
+                  <p className="text-xs text-slate-400">
+                    Visão rápida dos parâmetros e registros salvos na sua conta.
+                  </p>
                 </div>
                 <button
-                  type="submit"
-                  className="px-4 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 transition"
+                  type="button"
+                  onClick={() => setActiveTab('custos')}
+                  className="text-xs text-emerald-400 hover:underline font-medium shrink-0"
                 >
-                  Salvar Conexão Supabase
+                  Editar moto →
                 </button>
-              </form>
+              </div>
 
-              {/* SQL Schema pronto para copiar e colar no Supabase */}
-              <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-300">
-                    SQL para criar as tabelas no Supabase (SQL Editor)
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className="bg-slate-950 border border-slate-800 p-3.5 rounded-xl">
+                  <span className="text-[11px] text-slate-400 block">Moto Configurada</span>
+                  <span className="text-sm font-bold text-white mt-0.5 block truncate">
+                    {settings.bike_name}
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      navigator.clipboard.writeText(SQL_SCHEMA_TEXT);
-                      setCopiedSql(true);
-                      setTimeout(() => setCopiedSql(false), 2500);
-                    }}
-                    className="flex items-center gap-1 text-xs bg-slate-800 hover:bg-slate-700 px-2.5 py-1 rounded text-emerald-400"
-                  >
-                    {copiedSql ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                    {copiedSql ? 'SQL Copiado!' : 'Copiar SQL'}
-                  </button>
+                  <span className="text-[11px] text-emerald-400">
+                    {settings.fuel_consumption_km_l} km/L • {formatBRL(settings.fuel_price_per_liter)}/L
+                  </span>
                 </div>
-                <pre className="text-[11px] text-slate-400 overflow-x-auto max-h-40 p-2 bg-slate-900 rounded border border-slate-800">
-                  {SQL_SCHEMA_TEXT}
-                </pre>
+
+                <div className="bg-slate-950 border border-slate-800 p-3.5 rounded-xl">
+                  <span className="text-[11px] text-slate-400 block">Custo Total / KM</span>
+                  <span className="text-sm font-bold text-amber-400 mt-0.5 block">
+                    R$ {totalFixedCostPerKm.toFixed(3).replace('.', ',')}/km
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    {maintenanceItems.length} peças ativas
+                  </span>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 p-3.5 rounded-xl">
+                  <span className="text-[11px] text-slate-400 block">Dias Registrados</span>
+                  <span className="text-sm font-bold text-white mt-0.5 block">
+                    {sortedDailyLogs.length} dias
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    Último KM: {latestKmEnd > 0 ? `${latestKmEnd} km` : '—'}
+                  </span>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 p-3.5 rounded-xl">
+                  <span className="text-[11px] text-slate-400 block">Imprevistos</span>
+                  <span className="text-sm font-bold text-rose-400 mt-0.5 block">
+                    {unexpectedExpenses.length} registros
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    Total: {formatBRL(unexpectedExpenses.reduce((acc, u) => acc + u.amount, 0))}
+                  </span>
+                </div>
+              </div>
+
+              <div className="pt-1 flex flex-wrap items-center justify-between gap-3 border-t border-slate-800">
+                <span className="text-xs text-slate-400">
+                  Cópia de segurança local dos seus lançamentos e configurações:
+                </span>
+                <button
+                  type="button"
+                  onClick={handleExportBackup}
+                  className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-2 rounded-lg border border-slate-700 transition"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Exportar Backup (.json)
+                </button>
               </div>
             </div>
           </div>
@@ -2634,8 +2579,8 @@ export default function App() {
               activeTab === 'nuvem' ? 'text-emerald-400' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            <Cloud className="w-5 h-5" />
-            <span>Supabase</span>
+            <User className="w-5 h-5" />
+            <span>Minha Conta</span>
           </button>
         </div>
       </nav>
