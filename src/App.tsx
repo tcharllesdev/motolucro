@@ -1113,7 +1113,7 @@ export default function App() {
               <h1 className="font-bold text-lg leading-tight tracking-tight text-white flex flex-wrap items-center gap-2">
                 <span>MotoLucro</span>
                 <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-slate-800 text-emerald-400 border border-slate-700">
-                  R$ {totalFixedCostPerKm.toFixed(3).replace('.', ',')}/km custo
+                  {formatBRL(totalFixedCostPerKm)}/km custo
                 </span>
               </h1>
               <p className="text-xs text-slate-400 truncate">
@@ -1492,7 +1492,7 @@ export default function App() {
                           )}
                           {log.earnings === 0 && (
                             <span className="text-[11px] bg-amber-500/15 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded">
-                              Bruto pendente (R$ 0)
+                              Bruto pendente (R$ 0,00)
                             </span>
                           )}
                         </div>
@@ -2514,7 +2514,7 @@ export default function App() {
                 <div className="bg-slate-950 border border-slate-800 p-3.5 rounded-xl">
                   <span className="text-[11px] text-slate-400 block">Custo Total / KM</span>
                   <span className="text-sm font-bold text-amber-400 mt-0.5 block">
-                    R$ {totalFixedCostPerKm.toFixed(3).replace('.', ',')}/km
+                    {formatBRL(totalFixedCostPerKm)}/km
                   </span>
                   <span className="text-[11px] text-slate-400">
                     {maintenanceItems.length} peças ativas
