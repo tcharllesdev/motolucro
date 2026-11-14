@@ -525,7 +525,7 @@ export default function App() {
   }
 
   // Carregar um lançamento no formulário principal para edição
-  function startEditInMainForm(log: DailyLog) {
+  function startEditInMainForm(log: DailyLog, scrollToTop = true) {
     setEditingMainLogId(log.id);
     setLogDate(log.log_date);
     setEarnings(String(log.earnings));
@@ -534,8 +534,31 @@ export default function App() {
     setStartTime(log.start_time || '');
     setEndTime(log.end_time || '');
     setFormError('');
+    setSaveToast('');
     setActiveTab('lancar');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    if (scrollToTop) {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  }
+
+  // Ao selecionar uma data no formulário: se já houver registro salvo nesse dia, puxa os dados como edição
+  function handleMainDateChange(newDate: string) {
+    setFormError('');
+    setSaveToast('');
+    const existingForDate = dailyLogs.find((item) => item.log_date === newDate);
+    if (existingForDate) {
+      startEditInMainForm(existingForDate, false);
+    } else {
+      setLogDate(newDate);
+      if (editingMainLogId) {
+        setEditingMainLogId(null);
+        setEarnings('');
+        setKmStart(latestKmEnd > 0 ? String(latestKmEnd) : '');
+        setKmEnd('');
+        setStartTime('');
+        setEndTime('');
+      }
+    }
   }
 
   function cancelMainFormEdit() {
@@ -570,8 +593,9 @@ export default function App() {
     const totalKm = Number((end - start).toFixed(1));
     const existingLog = editingMainLogId
       ? dailyLogs.find((item) => item.id === editingMainLogId)
-      : undefined;
-    const recordId = editingMainLogId ? ensureValidUuid(editingMainLogId) : generateUuid();
+      : dailyLogs.find((item) => item.log_date === logDate);
+    const targetId = existingLog ? existingLog.id : editingMainLogId;
+    const recordId = targetId ? ensureValidUuid(targetId) : generateUuid();
 
     const savedLog: DailyLog = {
       id: recordId,
@@ -587,11 +611,13 @@ export default function App() {
 
     const updated = sortDailyLogsDesc([
       savedLog,
-      ...dailyLogs.filter((item) => item.id !== editingMainLogId && item.id !== recordId),
+      ...dailyLogs.filter(
+        (item) => item.id !== targetId && item.id !== recordId && item.log_date !== logDate
+      ),
     ]);
     setDailyLogs(updated);
 
-    const wasEditing = Boolean(editingMainLogId);
+    const wasEditing = Boolean(targetId);
     setEditingMainLogId(null);
 
     // Próximo lançamento volta para a data de hoje e puxa o maior KM Final como sugestão de KM Inicial
@@ -1184,18 +1210,22 @@ export default function App() {
                 {/* Linha 1: Data e Valor Obtido */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                   <div>
-                    <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
-                      Data da Corrida
-                    </label>
+                    <div className="flex items-center justify-between gap-1 mb-1.5">
+                      <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
+                        Data da Corrida
+                      </label>
+                      {editingMainLogId && (
+                        <span className="text-[11px] text-amber-300 font-medium">
+                          Dia já registrado (editando)
+                        </span>
+                      )}
+                    </div>
                     <div className="relative">
                       <input
                         type="date"
                         required
                         value={logDate}
-                        onChange={(e) => {
-                          setLogDate(e.target.value);
-                          setFormError('');
-                        }}
+                        onChange={(e) => handleMainDateChange(e.target.value)}
                         className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3.5 py-3 text-base text-white outline-none transition"
                       />
                     </div>
