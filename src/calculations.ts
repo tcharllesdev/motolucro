@@ -1,12 +1,57 @@
 import { BikeSettings, MaintenanceItem, DailyLog, UnexpectedExpense } from './types';
 
+export function getLocalTodayStr(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function generateUuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+export function ensureValidUuid(id: string): string {
+  if (UUID_REGEX.test(id)) return id;
+  // Converte IDs legados (ex: "seed-1", "maint-1") em um UUID determinístico válido para o PostgreSQL
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) {
+    hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+  }
+  const hex = hash.toString(16).padStart(8, '0');
+  const suffix = Array.from(id)
+    .map((ch) => ch.charCodeAt(0).toString(16).padStart(2, '0'))
+    .join('')
+    .padEnd(12, '0')
+    .slice(0, 12);
+  return `${hex}-0000-4000-8000-${suffix}`;
+}
+
+export function sortDailyLogsDesc(logs: DailyLog[]): DailyLog[] {
+  return [...logs].sort((a, b) => {
+    const dateCmp = b.log_date.localeCompare(a.log_date);
+    if (dateCmp !== 0) return dateCmp;
+    return (b.km_end || 0) - (a.km_end || 0);
+  });
+}
+
 export function calcHoursWorked(startTime?: string, endTime?: string): number {
   if (!startTime || !endTime) return 0;
   const [sh, sm] = startTime.split(':').map(Number);
   const [eh, em] = endTime.split(':').map(Number);
   if (isNaN(sh) || isNaN(sm) || isNaN(eh) || isNaN(em)) return 0;
 
-  let startMins = sh * 60 + sm;
+  const startMins = sh * 60 + sm;
   let endMins = eh * 60 + em;
   if (endMins < startMins) {
     // Passou da meia-noite
