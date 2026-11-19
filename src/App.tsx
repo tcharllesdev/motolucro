@@ -19,8 +19,14 @@ import {
   X,
   RotateCcw,
   User,
+  Send,
+  Copy,
+  Check,
+  ExternalLink,
+  RefreshCw,
+  Unlink,
 } from 'lucide-react';
-import { BikeSettings, MaintenanceItem, DailyLog, UnexpectedExpense } from './types';
+import { BikeSettings, MaintenanceItem, DailyLog, UnexpectedExpense, TelegramLink } from './types';
 import {
   DEFAULT_BIKE_SETTINGS,
   DEFAULT_MAINTENANCE_ITEMS,
@@ -56,6 +62,55 @@ const LS_UNEXPECTED_KEY = 'motolucro_unexpected_v1';
 const LS_LEGACY_SUPABASE_URL_KEY = 'motolucro_supabase_url';
 const LS_LEGACY_SUPABASE_ANON_KEY = 'motolucro_supabase_anon_key';
 const DEFAULT_START_TIME = '09:40';
+const TELEGRAM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+function generateTelegramPairingCode(length = 8): string {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  let code = '';
+  for (let i = 0; i < length; i += 1) {
+    code += TELEGRAM_CODE_ALPHABET[bytes[i] % TELEGRAM_CODE_ALPHABET.length];
+  }
+  return code;
+}
+
+function getTelegramBotUsername(): string {
+  const raw = import.meta.env.VITE_TELEGRAM_BOT_USERNAME;
+  if (typeof raw !== 'string') return '';
+  return raw.trim().replace(/^@+/, '');
+}
+
+function formatTelegramTime(isoString: string): string {
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fallback abaixo
+    }
+  }
+  if (typeof document === 'undefined') return false;
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
 
 const GROSS_PER_KM_TIER_CLASS: Record<GrossPerKmTier, string> = {
   low: 'text-red-400',
@@ -227,6 +282,18 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [cloudErrorBanner, setCloudErrorBanner] = useState<string>('');
 
+  // Estado da integração com Bot no Telegram
+  const [telegramLink, setTelegramLink] = useState<TelegramLink | null>(null);
+  const [telegramLoading, setTelegramLoading] = useState(false);
+  const [telegramCode, setTelegramCode] = useState<string | null>(null);
+  const [telegramCodeExpiresAt, setTelegramCodeExpiresAt] = useState<string | null>(null);
+  const [telegramCopied, setTelegramCopied] = useState(false);
+  const [telegramError, setTelegramError] = useState<string>('');
+  const [telegramInfo, setTelegramInfo] = useState<string>('');
+  const [confirmTelegramDisconnect, setConfirmTelegramDisconnect] = useState(false);
+  const [copiedTelegramExample, setCopiedTelegramExample] = useState<string | null>(null);
+  const telegramBotUsername = getTelegramBotUsername();
+
   // Credenciais do Supabase via variáveis de ambiente
   const isSbConfigured = getSupabaseCredentials().isConfigured;
 
@@ -299,6 +366,15 @@ export default function App() {
       } else {
         setUserEmail(null);
         setUserId(null);
+        setTelegramLink(null);
+        setTelegramLoading(false);
+        setTelegramCode(null);
+        setTelegramCodeExpiresAt(null);
+        setTelegramCopied(false);
+        setTelegramError('');
+        setTelegramInfo('');
+        setConfirmTelegramDisconnect(false);
+        setCopiedTelegramExample(null);
       }
     });
 
@@ -306,6 +382,12 @@ export default function App() {
       sub.subscription.unsubscribe();
     };
   }, [isSbConfigured]);
+
+  useEffect(() => {
+    if (activeTab === 'nuvem' && userId) {
+      void fetchTelegramLinkStatus(userId, true);
+    }
+  }, [activeTab, userId]);
 
   async function syncSettingsToSupabase(nextSettings: BikeSettings, showToast = false) {
     if (showToast) {
@@ -332,6 +414,162 @@ export default function App() {
     }
   }
 
+  async function fetchTelegramLinkStatus(
+    uid: string,
+    silentOnError = false
+  ): Promise<{ link: TelegramLink | null; error: string | null }> {
+    const client = getSupabaseClient();
+    if (!client) return { link: null, error: null };
+    try {
+      const { data, error } = await client
+        .from('telegram_links')
+        .select(
+          'user_id, telegram_user_id, telegram_chat_id, telegram_username, telegram_first_name, linked_at'
+        )
+        .eq('user_id', uid)
+        .maybeSingle();
+
+      if (error) {
+        if (!silentOnError) {
+          setTelegramError(`Não foi possível consultar o vínculo com o Telegram: ${error.message}`);
+        }
+        return { link: null, error: error.message };
+      }
+
+      const nextLink = data ? (data as TelegramLink) : null;
+      setTelegramLink(nextLink);
+      if (nextLink) {
+        setTelegramCode(null);
+        setTelegramCodeExpiresAt(null);
+        setTelegramCopied(false);
+        setTelegramError('');
+        setConfirmTelegramDisconnect(false);
+      }
+      return { link: nextLink, error: null };
+    } catch (err) {
+      const msg = getErrorMessage(err);
+      if (!silentOnError) {
+        setTelegramError(`Erro ao consultar conexão com o Telegram: ${msg}`);
+      }
+      return { link: null, error: msg };
+    }
+  }
+
+  async function handleGenerateTelegramCode() {
+    const client = getSupabaseClient();
+    if (!client || !userId) {
+      setTelegramError('Entre na sua conta na nuvem antes de gerar um código de conexão.');
+      return;
+    }
+
+    setTelegramLoading(true);
+    setTelegramError('');
+    setTelegramInfo('');
+    setTelegramCopied(false);
+
+    try {
+      const code = generateTelegramPairingCode(8);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+      const { error: deleteErr } = await client
+        .from('telegram_link_codes')
+        .delete()
+        .eq('user_id', userId)
+        .is('used_at', null);
+
+      if (deleteErr) throw deleteErr;
+
+      const { error: insertErr } = await client
+        .from('telegram_link_codes')
+        .insert({
+          user_id: userId,
+          code,
+          expires_at: expiresAt,
+        });
+
+      if (insertErr) throw insertErr;
+
+      setTelegramCode(code);
+      setTelegramCodeExpiresAt(expiresAt);
+    } catch (err) {
+      setTelegramError(`Erro ao gerar código de conexão: ${getErrorMessage(err)}`);
+    } finally {
+      setTelegramLoading(false);
+    }
+  }
+
+  async function handleCopyTelegramCommand() {
+    if (!telegramCode) return;
+    const command = `/vincular ${telegramCode}`;
+    const ok = await copyTextToClipboard(command);
+    if (ok) {
+      setTelegramCopied(true);
+      setTelegramError('');
+      window.setTimeout(() => setTelegramCopied(false), 2500);
+    } else {
+      setTelegramError('Não foi possível copiar automaticamente. Copie o comando manualmente.');
+    }
+  }
+
+  async function handleCopyTelegramExample(text: string) {
+    const ok = await copyTextToClipboard(text);
+    if (ok) {
+      setCopiedTelegramExample(text);
+      window.setTimeout(() => {
+        setCopiedTelegramExample((curr) => (curr === text ? null : curr));
+      }, 2000);
+    }
+  }
+
+  async function handleVerifyTelegramConnection() {
+    if (!userId) return;
+    setTelegramLoading(true);
+    setTelegramError('');
+    setTelegramInfo('');
+    try {
+      const { link, error } = await fetchTelegramLinkStatus(userId, false);
+      if (!error) {
+        if (link) {
+          setTelegramInfo('Telegram conectado com sucesso!');
+        } else {
+          setTelegramInfo(
+            'Conexão ainda não detectada. Envie o comando acima para o bot no Telegram e tente verificar novamente.'
+          );
+        }
+      }
+    } finally {
+      setTelegramLoading(false);
+    }
+  }
+
+  async function handleDisconnectTelegram() {
+    const client = getSupabaseClient();
+    if (!client || !userId) return;
+
+    setTelegramLoading(true);
+    setTelegramError('');
+    setTelegramInfo('');
+    try {
+      const { error } = await client
+        .from('telegram_links')
+        .delete()
+        .eq('user_id', userId);
+
+      if (error) throw error;
+
+      setTelegramLink(null);
+      setTelegramCode(null);
+      setTelegramCodeExpiresAt(null);
+      setTelegramCopied(false);
+      setConfirmTelegramDisconnect(false);
+      setTelegramInfo('Telegram desconectado desta conta.');
+    } catch (err) {
+      setTelegramError(`Erro ao desconectar Telegram: ${getErrorMessage(err)}`);
+    } finally {
+      setTelegramLoading(false);
+    }
+  }
+
   async function pullFromSupabase(uid: string) {
     const client = getSupabaseClient();
     if (!client) return;
@@ -354,6 +592,9 @@ export default function App() {
       if (firstErr) {
         throw new Error(firstErr.message);
       }
+
+      // Consulta status do vínculo Telegram sem quebrar o restante da sincronização
+      await fetchTelegramLinkStatus(uid, true);
 
       const hasRemoteData =
         Boolean(settingsRes.data) ||
@@ -1353,6 +1594,15 @@ export default function App() {
     setAuthPasswordInput('');
     setAuthMode('login');
     setCloudErrorBanner('');
+    setTelegramLink(null);
+    setTelegramLoading(false);
+    setTelegramCode(null);
+    setTelegramCodeExpiresAt(null);
+    setTelegramCopied(false);
+    setTelegramError('');
+    setTelegramInfo('');
+    setConfirmTelegramDisconnect(false);
+    setCopiedTelegramExample(null);
 
     setSettings(demoSettings);
     setFuelConsumptionInput(String(demoSettings.fuel_consumption_km_l));
@@ -3080,7 +3330,252 @@ export default function App() {
               )}
             </div>
 
-            {/* Card 2: Resumo dos Dados & Backup */}
+            {/* Card 2: Bot no Telegram */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <Send className="w-5 h-5 text-sky-400 shrink-0" aria-hidden="true" />
+                  <div className="min-w-0">
+                    <h3 className="text-base font-bold text-white">Bot no Telegram</h3>
+                    <p className="text-xs text-slate-400">
+                      Lance seus ganhos e quilometragem direto pelo Telegram sem precisar abrir o site.
+                    </p>
+                  </div>
+                </div>
+                {userEmail && userId && (
+                  <span
+                    className={`text-[11px] font-medium px-2.5 py-1 rounded-full border shrink-0 flex items-center gap-1.5 ${
+                      telegramLink
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                        : 'bg-slate-800 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    {telegramLink ? 'Conectado' : 'Não conectado'}
+                  </span>
+                )}
+              </div>
+
+              {telegramError && (
+                <div
+                  role="alert"
+                  className="p-3 rounded-xl bg-rose-950/60 border border-rose-500/40 text-xs text-rose-200 flex items-center gap-2"
+                >
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true" />
+                  <span>{telegramError}</span>
+                </div>
+              )}
+
+              {telegramInfo && (
+                <div
+                  role="status"
+                  className="p-3 rounded-xl bg-sky-950/40 border border-sky-500/30 text-xs text-sky-200 flex items-center gap-2"
+                >
+                  <CheckCircle2 className="w-4 h-4 text-sky-400 shrink-0" aria-hidden="true" />
+                  <span>{telegramInfo}</span>
+                </div>
+              )}
+
+              {!userEmail || !userId ? (
+                <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl text-xs text-slate-300">
+                  Entre ou crie sua conta na nuvem acima para conectar o Telegram e lançar seu dia direto pelo chat.
+                </div>
+              ) : telegramLink ? (
+                <div className="space-y-4">
+                  <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="space-y-0.5 min-w-0">
+                      <span className="text-[11px] text-slate-400 block">Conta vinculada</span>
+                      <span className="text-sm font-bold text-emerald-400 block truncate">
+                        {telegramLink.telegram_username
+                          ? `@${telegramLink.telegram_username}`
+                          : telegramLink.telegram_first_name || `ID ${telegramLink.telegram_user_id}`}
+                      </span>
+                      <span className="text-xs text-slate-400 block">
+                        Conectado em {formatDateBR(telegramLink.linked_at.slice(0, 10))}
+                      </span>
+                    </div>
+
+                    {confirmTelegramDisconnect ? (
+                      <div className="flex items-center gap-2 bg-rose-950/50 border border-rose-500/40 px-3 py-2 rounded-xl self-start sm:self-center">
+                        <span className="text-xs text-rose-200 font-medium">Desconectar?</span>
+                        <button
+                          type="button"
+                          disabled={telegramLoading}
+                          onClick={handleDisconnectTelegram}
+                          className="text-xs font-bold bg-rose-500 hover:bg-rose-400 disabled:opacity-60 text-slate-950 px-2.5 py-1.5 rounded-lg transition"
+                        >
+                          {telegramLoading ? 'Saindo...' : 'Confirmar'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={telegramLoading}
+                          onClick={() => setConfirmTelegramDisconnect(false)}
+                          className="text-xs text-slate-300 hover:text-white px-2 py-1.5"
+                        >
+                          Cancelar
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={telegramLoading}
+                        onClick={() => {
+                          setConfirmTelegramDisconnect(true);
+                          setTelegramError('');
+                        }}
+                        className="flex items-center justify-center gap-1.5 text-xs font-semibold bg-slate-800 hover:bg-rose-950/60 hover:text-rose-200 hover:border-rose-500/40 border border-slate-700 text-slate-200 px-3.5 py-2.5 rounded-xl transition shrink-0"
+                      >
+                        <Unlink className="w-3.5 h-3.5" aria-hidden="true" />
+                        Desconectar Telegram
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2.5">
+                    <span className="text-xs font-semibold text-slate-200 block">
+                      Exemplos prontos para enviar no Telegram:
+                    </span>
+                    <div className="space-y-2">
+                      {[
+                        { cmd: '10490 10620 250', desc: 'KM inicial, final e valor' },
+                        { cmd: '10490 10620 =120+85,50', desc: 'Com soma estilo Excel' },
+                        { cmd: 'ontem 10490 10620 200', desc: 'Lançar outro dia' },
+                        { cmd: '/ultimo', desc: 'Ver último lançamento' },
+                        { cmd: '/resumo', desc: 'Resumo recente' },
+                      ].map((item) => {
+                        const isCopied = copiedTelegramExample === item.cmd;
+                        return (
+                          <div
+                            key={item.cmd}
+                            className="flex items-center justify-between gap-2 bg-slate-900/80 border border-slate-800 rounded-lg px-3 py-2"
+                          >
+                            <div className="min-w-0">
+                              <code className="text-xs font-mono text-emerald-400 block truncate">
+                                {item.cmd}
+                              </code>
+                              <span className="text-[11px] text-slate-400 block">
+                                {item.desc}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void handleCopyTelegramExample(item.cmd)}
+                              aria-label={`Copiar exemplo ${item.cmd}`}
+                              className="shrink-0 flex items-center gap-1 text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 px-2.5 py-1.5 rounded-lg transition"
+                            >
+                              {isCopied ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+                                  <span className="text-emerald-300">Copiado!</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" aria-hidden="true" />
+                                  <span>Copiar</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-4">
+                  {!telegramCode ? (
+                    <div className="space-y-3">
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        Gere um código temporário de conexão e envie no chat do bot no Telegram para vincular esta conta.
+                      </p>
+                      <button
+                        type="button"
+                        disabled={telegramLoading || !isSbConfigured}
+                        onClick={handleGenerateTelegramCode}
+                        className="w-full sm:w-auto flex items-center justify-center gap-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition"
+                      >
+                        <Send className="w-4 h-4" aria-hidden="true" />
+                        {telegramLoading ? 'Gerando código...' : 'Gerar Código de Conexão'}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-3.5">
+                      <div className="space-y-1">
+                        <span className="text-xs text-slate-300 block">
+                          Envie este comando no chat do bot no Telegram:
+                        </span>
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-900 border border-slate-700 rounded-xl p-3">
+                          <code className="font-mono text-sm sm:text-base font-bold text-emerald-400 tracking-wide select-all break-all">
+                            /vincular {telegramCode}
+                          </code>
+                          <button
+                            type="button"
+                            onClick={handleCopyTelegramCommand}
+                            className="shrink-0 flex items-center justify-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold text-xs px-3 py-2 rounded-lg transition"
+                          >
+                            {telegramCopied ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+                                <span className="text-emerald-300">Copiado!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" aria-hidden="true" />
+                                <span>Copiar comando</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+
+                      <p className="text-[11px] text-amber-300/90">
+                        Expira em 10 minutos
+                        {telegramCodeExpiresAt && formatTelegramTime(telegramCodeExpiresAt)
+                          ? ` (até ${formatTelegramTime(telegramCodeExpiresAt)})`
+                          : ''}.
+                      </p>
+
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        {telegramBotUsername && (
+                          <a
+                            href={`https://t.me/${telegramBotUsername}?start=${encodeURIComponent(telegramCode)}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center justify-center gap-1.5 bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+                            Abrir no Telegram
+                          </a>
+                        )}
+
+                        <button
+                          type="button"
+                          disabled={telegramLoading}
+                          onClick={handleVerifyTelegramConnection}
+                          className="flex items-center justify-center gap-1.5 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition"
+                        >
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 ${telegramLoading ? 'animate-spin' : ''}`}
+                            aria-hidden="true"
+                          />
+                          {telegramLoading ? 'Verificando...' : 'Verificar Conexão'}
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={telegramLoading}
+                          onClick={handleGenerateTelegramCode}
+                          className="flex items-center justify-center gap-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 font-semibold text-xs px-3.5 py-2.5 rounded-xl transition"
+                        >
+                          Gerar novo código
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Card 3: Resumo dos Dados & Backup */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
               <div className="flex items-center justify-between gap-2">
                 <div>

@@ -29,3 +29,12 @@ export interface UnexpectedExpense {
   description: string;
   amount: number;
 }
+
+export interface TelegramLink {
+  user_id: string;
+  telegram_user_id: number;
+  telegram_chat_id: number;
+  telegram_username: string | null;
+  telegram_first_name: string | null;
+  linked_at: string;
+}
