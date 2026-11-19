@@ -43,6 +43,7 @@ import {
 import { getSupabaseClient, getSupabaseCredentials } from './supabaseClient';
 import { evaluateEarningsExpression, formatEarningsInputValue } from './earningsExpression';
 import { EarningsInput } from './components/EarningsInput';
+import { DateInput } from './components/DateInput';
 
 const LS_SETTINGS_KEY = 'motolucro_bike_settings_v1';
 const LS_MAINT_KEY = 'motolucro_maint_items_v1';
@@ -1560,9 +1561,8 @@ export default function App() {
                       )}
                     </div>
                     <div className="relative">
-                      <input
+                      <DateInput
                         id="log-date"
-                        type="date"
                         required
                         value={logDate}
                         onChange={(e) => handleMainDateChange(e.target.value)}
@@ -2012,9 +2012,8 @@ export default function App() {
                             >
                               Data
                             </label>
-                            <input
+                            <DateInput
                               id={`hist-edit-date-${log.id}`}
-                              type="date"
                               required
                               value={histEditDate}
                               onChange={(e) => setHistEditDate(e.target.value)}
@@ -2637,9 +2636,8 @@ export default function App() {
                     <label htmlFor="unexp-date" className="block text-[11px] text-slate-400 mb-1">
                       Data do Imprevisto
                     </label>
-                    <input
+                    <DateInput
                       id="unexp-date"
-                      type="date"
                       required
                       value={unexpDate}
                       onChange={(e) => setUnexpDate(e.target.value)}
@@ -2719,9 +2717,8 @@ export default function App() {
                               >
                                 Data
                               </label>
-                              <input
+                              <DateInput
                                 id={`unexp-edit-date-${u.id}`}
-                                type="date"
                                 required
                                 value={unexpEditDate}
                                 onChange={(e) => setUnexpEditDate(e.target.value)}
