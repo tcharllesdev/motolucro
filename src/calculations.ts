@@ -234,3 +234,37 @@ export function formatDateBR(dateStr: string): string {
   if (parts.length !== 3) return dateStr;
   return `${parts[2]}/${parts[1]}/${parts[0]}`;
 }
+
+const WEEKDAYS = [
+  'domingo',
+  'segunda',
+  'terça',
+  'quarta',
+  'quinta',
+  'sexta',
+  'sábado',
+] as const;
+
+/**
+ * Retorna o nome curto/informal do dia da semana (ex: 'quinta', 'sexta', 'sábado')
+ * a partir de uma data no formato YYYY-MM-DD, evitando problemas de fuso horário UTC.
+ */
+export function getWeekdayName(dateStr: string): string {
+  if (!dateStr) return '';
+  const parts = dateStr.split('-');
+  if (parts.length !== 3) return '';
+  const [year, month, day] = parts.map(Number);
+  if (!year || !month || !day) return '';
+  const date = new Date(year, month - 1, day);
+  return WEEKDAYS[date.getDay()] ?? '';
+}
+
+/**
+ * Retorna a data no formato brasileiro com o dia da semana entre parênteses.
+ * Exemplo: '19/11/2026 (quinta)'
+ */
+export function formatDateWithWeekday(dateStr: string): string {
+  const formatted = formatDateBR(dateStr);
+  const weekday = getWeekdayName(dateStr);
+  return weekday ? `${formatted} (${weekday})` : formatted;
+}
