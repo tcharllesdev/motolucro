@@ -1,5 +1,15 @@
 import { BikeSettings, MaintenanceItem, DailyLog, UnexpectedExpense } from './types';
 
+export type GrossPerKmTier = 'low' | 'medium' | 'high';
+
+export function getGrossPerKmTier(grossPerKm: number): GrossPerKmTier {
+  if (!Number.isFinite(grossPerKm)) return 'low';
+  const rounded = Math.round(grossPerKm * 100) / 100;
+  if (rounded < 1.5) return 'low';
+  if (rounded < 2.0) return 'medium';
+  return 'high';
+}
+
 export function getLocalTodayStr(): string {
   const now = new Date();
   const year = now.getFullYear();
