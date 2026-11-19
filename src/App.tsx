@@ -41,6 +41,8 @@ import {
   sortDailyLogsDesc,
 } from './calculations';
 import { getSupabaseClient, getSupabaseCredentials } from './supabaseClient';
+import { evaluateEarningsExpression, formatEarningsInputValue } from './earningsExpression';
+import { EarningsInput } from './components/EarningsInput';
 
 const LS_SETTINGS_KEY = 'motolucro_bike_settings_v1';
 const LS_MAINT_KEY = 'motolucro_maint_items_v1';
@@ -519,11 +521,16 @@ export default function App() {
     }
   }
 
+  const evaluatedMainEarnings = useMemo(
+    () => evaluateEarningsExpression(earnings),
+    [earnings]
+  );
+
   // Preview em tempo real do lançamento atual
   const livePreviewLog: DailyLog = useMemo(() => {
     const start = parseFloat(kmStart.replace(',', '.')) || 0;
     const end = parseFloat(kmEnd.replace(',', '.')) || 0;
-    const val = parseFloat(earnings.replace(',', '.')) || 0;
+    const val = evaluatedMainEarnings.previewValue;
     const totalKm = end > start ? Number((end - start).toFixed(1)) : 0;
     return {
       id: editingMainLogId || 'preview',
@@ -535,7 +542,15 @@ export default function App() {
       start_time: startTime,
       end_time: endTime,
     };
-  }, [editingMainLogId, logDate, kmStart, kmEnd, earnings, startTime, endTime]);
+  }, [
+    editingMainLogId,
+    logDate,
+    kmStart,
+    kmEnd,
+    evaluatedMainEarnings.previewValue,
+    startTime,
+    endTime,
+  ]);
 
   const unexpectedOnFormDate = useMemo(
     () =>
@@ -665,7 +680,7 @@ export default function App() {
   function startEditInMainForm(log: DailyLog, scrollToTop = true) {
     setEditingMainLogId(log.id);
     setLogDate(log.log_date);
-    setEarnings(String(log.earnings));
+    setEarnings(formatEarningsInputValue(log.earnings));
     setKmStart(String(log.km_start));
     setKmEnd(String(log.km_end));
     setStartTime(log.start_time || '');
@@ -716,12 +731,13 @@ export default function App() {
 
     const start = parseFloat(kmStart.replace(',', '.'));
     const end = parseFloat(kmEnd.replace(',', '.'));
-    const val = parseFloat(earnings.replace(',', '.'));
+    const parsedEarnings = evaluateEarningsExpression(earnings);
 
-    if (isNaN(val) || val < 0) {
-      setFormError('Informe um valor obtido válido (0 ou maior).');
+    if (parsedEarnings.status !== 'valid' || parsedEarnings.value === null) {
+      setFormError(parsedEarnings.error || 'Informe um valor obtido válido (0 ou maior).');
       return;
     }
+    const val = parsedEarnings.value;
     if (isNaN(start) || isNaN(end) || end <= start) {
       setFormError('O KM Final deve ser maior que o KM Inicial.');
       return;
@@ -806,7 +822,7 @@ export default function App() {
   function startInlineHistoryEdit(log: DailyLog) {
     setHistEditId(log.id);
     setHistEditDate(log.log_date);
-    setHistEditEarnings(String(log.earnings));
+    setHistEditEarnings(formatEarningsInputValue(log.earnings));
     setHistEditKmStart(String(log.km_start));
     setHistEditKmEnd(String(log.km_end));
     setHistEditStartTime(log.start_time || '');
@@ -820,12 +836,13 @@ export default function App() {
     setHistEditError('');
     const start = parseFloat(histEditKmStart.replace(',', '.'));
     const end = parseFloat(histEditKmEnd.replace(',', '.'));
-    const val = parseFloat(histEditEarnings.replace(',', '.'));
+    const parsedEarnings = evaluateEarningsExpression(histEditEarnings);
 
-    if (isNaN(val) || val < 0) {
-      setHistEditError('Informe um valor obtido válido (0 ou maior).');
+    if (parsedEarnings.status !== 'valid' || parsedEarnings.value === null) {
+      setHistEditError(parsedEarnings.error || 'Informe um valor obtido válido (0 ou maior).');
       return;
     }
+    const val = parsedEarnings.value;
     if (isNaN(start) || isNaN(end) || end <= start) {
       setHistEditError('O KM Final deve ser maior que o KM Inicial.');
       return;
@@ -1561,28 +1578,18 @@ export default function App() {
                     >
                       Valor Obtido no Dia (R$) *
                     </label>
-                    <div className="relative">
-                      <span
-                        aria-hidden="true"
-                        className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-semibold"
-                      >
-                        R$
-                      </span>
-                      <input
-                        id="log-earnings"
-                        type="number"
-                        step="0.01"
-                        inputMode="decimal"
-                        required
-                        placeholder="Ex: 210,50"
-                        value={earnings}
-                        onChange={(e) => {
-                          setEarnings(e.target.value);
-                          setFormError('');
-                        }}
-                        className="w-full bg-slate-950 border border-emerald-500/40 focus:border-emerald-400 rounded-xl pl-10 pr-3.5 py-3 text-lg font-bold text-white outline-none transition"
-                      />
-                    </div>
+                    <EarningsInput
+                      id="log-earnings"
+                      variant="default"
+                      required
+                      placeholder="Ex: 210,50 ou =120+85,50"
+                      value={earnings}
+                      resetKey={`${editingMainLogId ?? 'new'}:${logDate}`}
+                      onChange={(nextValue) => {
+                        setEarnings(nextValue);
+                        setFormError('');
+                      }}
+                    />
                   </div>
                 </div>
 
@@ -2021,14 +2028,17 @@ export default function App() {
                             >
                               Valor Bruto (R$)
                             </label>
-                            <input
+                            <EarningsInput
                               id={`hist-edit-earnings-${log.id}`}
-                              type="number"
-                              step="0.01"
+                              variant="compact"
                               required
+                              placeholder="210,50 ou =120+85"
                               value={histEditEarnings}
-                              onChange={(e) => setHistEditEarnings(e.target.value)}
-                              className="w-full bg-slate-900 border border-emerald-500/40 rounded-lg px-2.5 py-2 text-xs font-bold text-white"
+                              resetKey={log.id}
+                              onChange={(nextValue) => {
+                                setHistEditEarnings(nextValue);
+                                setHistEditError('');
+                              }}
                             />
                           </div>
                           <div>
