@@ -39,6 +39,8 @@ import {
   generateUuid,
   ensureValidUuid,
   sortDailyLogsDesc,
+  getGrossPerKmTier,
+  GrossPerKmTier,
 } from './calculations';
 import { getSupabaseClient, getSupabaseCredentials } from './supabaseClient';
 import { evaluateEarningsExpression, formatEarningsInputValue } from './earningsExpression';
@@ -51,6 +53,13 @@ const LS_LOGS_KEY = 'motolucro_daily_logs_v1';
 const LS_UNEXPECTED_KEY = 'motolucro_unexpected_v1';
 const LS_LEGACY_SUPABASE_URL_KEY = 'motolucro_supabase_url';
 const LS_LEGACY_SUPABASE_ANON_KEY = 'motolucro_supabase_anon_key';
+const DEFAULT_START_TIME = '09:40';
+
+const GROSS_PER_KM_TIER_CLASS: Record<GrossPerKmTier, string> = {
+  low: 'text-red-400',
+  medium: 'text-yellow-400',
+  high: 'text-emerald-400',
+};
 
 type TabType = 'lancar' | 'historico' | 'custos' | 'imprevistos' | 'nuvem';
 type AuthStatusKind = 'success' | 'warning' | 'error' | 'info';
@@ -225,7 +234,7 @@ export default function App() {
   const [kmStart, setKmStart] = useState<string>(() => (latestKmEnd > 0 ? String(latestKmEnd) : ''));
   const [kmEnd, setKmEnd] = useState('');
   const [earnings, setEarnings] = useState('');
-  const [startTime, setStartTime] = useState('');
+  const [startTime, setStartTime] = useState(DEFAULT_START_TIME);
   const [endTime, setEndTime] = useState('');
   const [editingMainLogId, setEditingMainLogId] = useState<string | null>(null);
   const [formError, setFormError] = useState<string>('');
@@ -708,7 +717,7 @@ export default function App() {
         setEarnings('');
         setKmStart(latestKmEnd > 0 ? String(latestKmEnd) : '');
         setKmEnd('');
-        setStartTime('');
+        setStartTime(DEFAULT_START_TIME);
         setEndTime('');
       }
     }
@@ -720,7 +729,7 @@ export default function App() {
     setEarnings('');
     setKmStart(latestKmEnd > 0 ? String(latestKmEnd) : '');
     setKmEnd('');
-    setStartTime('');
+    setStartTime(DEFAULT_START_TIME);
     setEndTime('');
     setFormError('');
   }
@@ -780,7 +789,7 @@ export default function App() {
     setKmStart(String(nextLatestKm));
     setKmEnd('');
     setEarnings('');
-    setStartTime('');
+    setStartTime(DEFAULT_START_TIME);
     setEndTime('');
     setSaveToast(
       wasEditing
@@ -1189,17 +1198,25 @@ export default function App() {
   }
 
   // Filtro de mês no histórico
+  const currentMonth = todayStr.slice(0, 7);
+
   const availableMonths = useMemo(() => {
-    const set = new Set<string>();
+    const set = new Set<string>([currentMonth]);
     sortedDailyLogs.forEach((l) => {
       if (l.log_date && l.log_date.length >= 7) {
         set.add(l.log_date.slice(0, 7));
       }
     });
     return Array.from(set).sort().reverse();
-  }, [sortedDailyLogs]);
+  }, [sortedDailyLogs, currentMonth]);
 
-  const [selectedMonth, setSelectedMonth] = useState<string>('all');
+  const [selectedMonth, setSelectedMonth] = useState<string>(currentMonth);
+
+  useEffect(() => {
+    if (activeTab === 'historico') {
+      setSelectedMonth(getLocalTodayStr().slice(0, 7));
+    }
+  }, [activeTab]);
 
   const filteredLogs = useMemo(() => {
     if (selectedMonth === 'all') return sortedDailyLogs;
@@ -1343,7 +1360,7 @@ export default function App() {
     setMaintenanceItems(demoMaintenance);
     setDailyLogs(demoLogs);
     setUnexpectedExpenses(demoUnexpected);
-    setSelectedMonth('all');
+    setSelectedMonth(freshToday.slice(0, 7));
 
     setUndoData(null);
     setConfirmDeleteId(null);
@@ -1353,7 +1370,7 @@ export default function App() {
     setKmStart(demoLatestKm > 0 ? String(demoLatestKm) : '');
     setKmEnd('');
     setEarnings('');
-    setStartTime('');
+    setStartTime(DEFAULT_START_TIME);
     setEndTime('');
     setFormError('');
     setSaveToast('');
@@ -1912,6 +1929,7 @@ export default function App() {
                   {availableMonths.map((m) => (
                     <option key={m} value={m}>
                       Mês {m.split('-')[1]}/{m.split('-')[0]}
+                      {m === currentMonth ? ' (Atual)' : ''}
                     </option>
                   ))}
                 </select>
@@ -1934,7 +1952,13 @@ export default function App() {
                 <span className="text-lg font-bold text-white mt-0.5 block">
                   {formatBRL(summaryStats.totalGross)}
                 </span>
-                <span className="text-[11px] text-slate-400">
+                <span
+                  className={`text-[11px] ${
+                    summaryStats.totalKm > 0
+                      ? `${GROSS_PER_KM_TIER_CLASS[getGrossPerKmTier(summaryStats.avgGrossPerKm)]} font-semibold`
+                      : 'text-slate-400'
+                  }`}
+                >
                   Média: {formatBRL(summaryStats.avgGrossPerKm)}/km
                 </span>
               </div>
@@ -1979,7 +2003,23 @@ export default function App() {
               </div>
 
               <div className="divide-y divide-slate-800/80 max-h-[600px] overflow-y-auto">
-                {filteredLogs.map((log) => {
+                {filteredLogs.length === 0 ? (
+                  <div className="p-8 text-center space-y-3">
+                    <p className="text-sm text-slate-400">
+                      Nenhum lançamento registrado neste período.
+                    </p>
+                    {selectedMonth !== 'all' && sortedDailyLogs.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setSelectedMonth('all')}
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 px-3.5 py-2 rounded-lg transition"
+                      >
+                        Ver todo o histórico
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  filteredLogs.map((log) => {
                   const m = calculateDayMetrics(log, settings, maintenanceItems, unexpectedExpenses);
                   const isEditingThis = histEditId === log.id;
                   const isConfirmingDelete = confirmDeleteId === log.id;
@@ -2164,7 +2204,10 @@ export default function App() {
                             Bruto: <strong className="text-slate-200">{formatBRL(m.grossEarnings)}</strong>
                           </span>
                           <span>
-                            Valor/KM: <strong className="text-slate-200">{formatBRL(m.grossPerKm)}</strong>
+                            Valor/KM:{' '}
+                            <strong className={GROSS_PER_KM_TIER_CLASS[getGrossPerKmTier(m.grossPerKm)]}>
+                              {formatBRL(m.grossPerKm)}
+                            </strong>
                           </span>
                           <span>
                             Gasolina: <strong className="text-amber-400">-{formatBRL(m.fuelCost)}</strong>
@@ -2238,7 +2281,8 @@ export default function App() {
                       </div>
                     </div>
                   );
-                })}
+                })
+                )}
               </div>
             </div>
           </div>
