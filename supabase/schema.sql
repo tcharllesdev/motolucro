@@ -1,6 +1,7 @@
 -- ============================================================================
 -- SCHEMA SQL: MOTOLUCRO (SUPABASE POSTGRESQL)
--- Cole e execute este script no SQL Editor do seu projeto no Supabase
+-- Espelho atualizado do schema em produção (projeto acrpfisrulqqruwbfopz)
+-- Pode ser executado em um projeto limpo no SQL Editor do Supabase
 -- ============================================================================
 
 -- 1. Configurações de Consumo e Combustível por Usuário
@@ -48,7 +49,36 @@ create table if not exists public.unexpected_expenses (
 );
 
 -- ============================================================================
--- ROW LEVEL SECURITY (RLS) - Cada usuário vê e edita apenas seus próprios dados
+-- ÍNDICES COMPOSTOS (FK user_id + ordenações principais da aplicação)
+-- ============================================================================
+
+create index if not exists idx_daily_logs_user_date
+  on public.daily_logs (user_id, log_date desc);
+
+create index if not exists idx_maintenance_items_user_created
+  on public.maintenance_items (user_id, created_at asc);
+
+create index if not exists idx_unexpected_expenses_user_date
+  on public.unexpected_expenses (user_id, expense_date desc);
+
+-- ============================================================================
+-- PRIVILÉGIOS (Princípio do menor privilégio)
+-- Nenhum privilégio de tabela para anon/PUBLIC; apenas CRUD para authenticated
+-- ============================================================================
+
+revoke all on table public.bike_settings from public, anon, authenticated;
+revoke all on table public.maintenance_items from public, anon, authenticated;
+revoke all on table public.daily_logs from public, anon, authenticated;
+revoke all on table public.unexpected_expenses from public, anon, authenticated;
+
+grant select, insert, update, delete on table public.bike_settings to authenticated;
+grant select, insert, update, delete on table public.maintenance_items to authenticated;
+grant select, insert, update, delete on table public.daily_logs to authenticated;
+grant select, insert, update, delete on table public.unexpected_expenses to authenticated;
+
+-- ============================================================================
+-- ROW LEVEL SECURITY (RLS) - Cada usuário autenticado gerencia apenas seus dados
+-- Usa (select auth.uid()) para evitar reavaliação por linha (initPlan)
 -- ============================================================================
 
 alter table public.bike_settings enable row level security;
@@ -56,14 +86,30 @@ alter table public.maintenance_items enable row level security;
 alter table public.daily_logs enable row level security;
 alter table public.unexpected_expenses enable row level security;
 
+drop policy if exists "Users manage own bike_settings" on public.bike_settings;
 create policy "Users manage own bike_settings" on public.bike_settings
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all
+  to authenticated
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
 
+drop policy if exists "Users manage own maintenance_items" on public.maintenance_items;
 create policy "Users manage own maintenance_items" on public.maintenance_items
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all
+  to authenticated
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
 
+drop policy if exists "Users manage own daily_logs" on public.daily_logs;
 create policy "Users manage own daily_logs" on public.daily_logs
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all
+  to authenticated
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
 
+drop policy if exists "Users manage own unexpected_expenses" on public.unexpected_expenses;
 create policy "Users manage own unexpected_expenses" on public.unexpected_expenses
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all
+  to authenticated
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);

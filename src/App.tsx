@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Bike,
   PlusCircle,
@@ -31,6 +31,7 @@ import {
   calcFuelCostPerKm,
   calcMaintenanceCostPerKm,
   calculateDayMetrics,
+  calculatePeriodSummary,
   formatBRL,
   formatPerKm,
   formatDateBR,
@@ -45,8 +46,16 @@ const LS_SETTINGS_KEY = 'motolucro_bike_settings_v1';
 const LS_MAINT_KEY = 'motolucro_maint_items_v1';
 const LS_LOGS_KEY = 'motolucro_daily_logs_v1';
 const LS_UNEXPECTED_KEY = 'motolucro_unexpected_v1';
+const LS_LEGACY_SUPABASE_URL_KEY = 'motolucro_supabase_url';
+const LS_LEGACY_SUPABASE_ANON_KEY = 'motolucro_supabase_anon_key';
 
 type TabType = 'lancar' | 'historico' | 'custos' | 'imprevistos' | 'nuvem';
+type AuthStatusKind = 'success' | 'warning' | 'error' | 'info';
+
+interface AuthStatusMessage {
+  kind: AuthStatusKind;
+  text: string;
+}
 
 interface UndoPayload {
   kind: 'log' | 'maint' | 'unexp';
@@ -61,16 +70,53 @@ function getCurrentTimeHHMM(): string {
   return `${hh}:${mm}`;
 }
 
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (
+    typeof err === 'object' &&
+    err !== null &&
+    'message' in err &&
+    typeof (err as { message: unknown }).message === 'string'
+  ) {
+    return (err as { message: string }).message;
+  }
+  return String(err);
+}
+
+function createDemoSettings(): BikeSettings {
+  return { ...DEFAULT_BIKE_SETTINGS };
+}
+
+function createDemoMaintenanceItems(): MaintenanceItem[] {
+  return DEFAULT_MAINTENANCE_ITEMS.map((item) => ({ ...item, id: ensureValidUuid(item.id) }));
+}
+
+function createDemoDailyLogs(): DailyLog[] {
+  return sortDailyLogsDesc(SEED_DAILY_LOGS.map((log) => ({ ...log, id: ensureValidUuid(log.id) })));
+}
+
+function createDemoUnexpectedExpenses(): UnexpectedExpense[] {
+  return DEFAULT_UNEXPECTED_EXPENSES.map((u) => ({ ...u, id: ensureValidUuid(u.id) }));
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabType>('lancar');
 
-  // Estado principal (com fallback imediato para LocalStorage + Planilha Inicial e IDs normalizados)
+  // Evita regravar no localStorage imediatamente após limpar dados no logout
+  const skipPersistRef = useRef({
+    settings: false,
+    maint: false,
+    logs: false,
+    unexp: false,
+  });
+
+  // Estado principal (com fallback imediato para LocalStorage + Dados Demo e IDs normalizados)
   const [settings, setSettings] = useState<BikeSettings>(() => {
     try {
       const saved = localStorage.getItem(LS_SETTINGS_KEY);
-      return saved ? JSON.parse(saved) : DEFAULT_BIKE_SETTINGS;
+      return saved ? JSON.parse(saved) : createDemoSettings();
     } catch {
-      return DEFAULT_BIKE_SETTINGS;
+      return createDemoSettings();
     }
   });
 
@@ -80,7 +126,7 @@ export default function App() {
       const raw: MaintenanceItem[] = saved ? JSON.parse(saved) : DEFAULT_MAINTENANCE_ITEMS;
       return raw.map((item) => ({ ...item, id: ensureValidUuid(item.id) }));
     } catch {
-      return DEFAULT_MAINTENANCE_ITEMS.map((item) => ({ ...item, id: ensureValidUuid(item.id) }));
+      return createDemoMaintenanceItems();
     }
   });
 
@@ -90,7 +136,7 @@ export default function App() {
       const raw: DailyLog[] = saved ? JSON.parse(saved) : SEED_DAILY_LOGS;
       return sortDailyLogsDesc(raw.map((log) => ({ ...log, id: ensureValidUuid(log.id) })));
     } catch {
-      return sortDailyLogsDesc(SEED_DAILY_LOGS.map((log) => ({ ...log, id: ensureValidUuid(log.id) })));
+      return createDemoDailyLogs();
     }
   });
 
@@ -100,7 +146,7 @@ export default function App() {
       const raw: UnexpectedExpense[] = saved ? JSON.parse(saved) : DEFAULT_UNEXPECTED_EXPENSES;
       return raw.map((u) => ({ ...u, id: ensureValidUuid(u.id) }));
     } catch {
-      return DEFAULT_UNEXPECTED_EXPENSES.map((u) => ({ ...u, id: ensureValidUuid(u.id) }));
+      return createDemoUnexpectedExpenses();
     }
   });
 
@@ -126,18 +172,34 @@ export default function App() {
 
   // Persistência local automática a cada mudança
   useEffect(() => {
+    if (skipPersistRef.current.settings) {
+      skipPersistRef.current.settings = false;
+      return;
+    }
     localStorage.setItem(LS_SETTINGS_KEY, JSON.stringify(settings));
   }, [settings]);
 
   useEffect(() => {
+    if (skipPersistRef.current.maint) {
+      skipPersistRef.current.maint = false;
+      return;
+    }
     localStorage.setItem(LS_MAINT_KEY, JSON.stringify(maintenanceItems));
   }, [maintenanceItems]);
 
   useEffect(() => {
+    if (skipPersistRef.current.logs) {
+      skipPersistRef.current.logs = false;
+      return;
+    }
     localStorage.setItem(LS_LOGS_KEY, JSON.stringify(dailyLogs));
   }, [dailyLogs]);
 
   useEffect(() => {
+    if (skipPersistRef.current.unexp) {
+      skipPersistRef.current.unexp = false;
+      return;
+    }
     localStorage.setItem(LS_UNEXPECTED_KEY, JSON.stringify(unexpectedExpenses));
   }, [unexpectedExpenses]);
 
@@ -147,11 +209,11 @@ export default function App() {
   const [authEmailInput, setAuthEmailInput] = useState('');
   const [authPasswordInput, setAuthPasswordInput] = useState('');
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
-  const [authStatus, setAuthStatus] = useState<string>('');
+  const [authStatus, setAuthStatus] = useState<AuthStatusMessage | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [cloudErrorBanner, setCloudErrorBanner] = useState<string>('');
 
-  // Credenciais pré-configuradas do Supabase
+  // Credenciais do Supabase via variáveis de ambiente
   const isSbConfigured = getSupabaseCredentials().isConfigured;
 
   // Formulário de Lançamento Diário Rápido (data em fuso local + KM Inicial preenchido com último KM Final)
@@ -199,13 +261,22 @@ export default function App() {
     const client = getSupabaseClient();
     if (!client) return;
 
-    client.auth.getSession().then(({ data }) => {
-      if (data.session?.user) {
-        setUserEmail(data.session.user.email ?? 'Logado');
-        setUserId(data.session.user.id);
-        pullFromSupabase(data.session.user.id);
-      }
-    });
+    client.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (error) {
+          setCloudErrorBanner(`Erro ao verificar sessão na nuvem: ${error.message}`);
+          return;
+        }
+        if (data.session?.user) {
+          setUserEmail(data.session.user.email ?? 'Logado');
+          setUserId(data.session.user.id);
+          pullFromSupabase(data.session.user.id);
+        }
+      })
+      .catch((err) => {
+        setCloudErrorBanner(`Erro ao verificar sessão na nuvem: ${getErrorMessage(err)}`);
+      });
 
     const { data: sub } = client.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
@@ -229,17 +300,21 @@ export default function App() {
     }
     const client = getSupabaseClient();
     if (!client || !userId) return;
-    const { error } = await client.from('bike_settings').upsert({
-      user_id: userId,
-      bike_name: nextSettings.bike_name,
-      fuel_consumption_km_l: nextSettings.fuel_consumption_km_l,
-      fuel_price_per_liter: nextSettings.fuel_price_per_liter,
-      updated_at: new Date().toISOString(),
-    });
-    if (error) {
-      setCloudErrorBanner(`Erro ao salvar configurações na nuvem: ${error.message}`);
-    } else {
-      setCloudErrorBanner('');
+    try {
+      const { error } = await client.from('bike_settings').upsert({
+        user_id: userId,
+        bike_name: nextSettings.bike_name,
+        fuel_consumption_km_l: nextSettings.fuel_consumption_km_l,
+        fuel_price_per_liter: nextSettings.fuel_price_per_liter,
+        updated_at: new Date().toISOString(),
+      });
+      if (error) {
+        setCloudErrorBanner(`Erro ao salvar configurações na nuvem: ${error.message}`);
+      } else {
+        setCloudErrorBanner('');
+      }
+    } catch (err) {
+      setCloudErrorBanner(`Erro ao salvar configurações na nuvem: ${getErrorMessage(err)}`);
     }
   }
 
@@ -273,9 +348,10 @@ export default function App() {
         (unexpRes.data && unexpRes.data.length > 0);
 
       if (!hasRemoteData) {
-        setAuthStatus(
-          'Conta conectada! Nenhum dado salvo na nuvem ainda — clique em "Enviar Dados Locais para a Nuvem" para sincronizar seu histórico.'
-        );
+        setAuthStatus({
+          kind: 'info',
+          text: 'Conta conectada! Nenhum dado salvo na nuvem ainda — clique em "Sincronizar Dados com a Nuvem" para enviar seu histórico.',
+        });
         return;
       }
 
@@ -292,9 +368,9 @@ export default function App() {
 
       if (maintRes.data) {
         setMaintenanceItems(
-          maintRes.data.map((m: any) => ({
-            id: m.id,
-            name: m.name,
+          maintRes.data.map((m: Record<string, unknown>) => ({
+            id: String(m.id),
+            name: String(m.name),
             cost: Number(m.cost),
             duration_km: Number(m.duration_km),
           }))
@@ -303,16 +379,16 @@ export default function App() {
 
       if (logsRes.data) {
         const mappedLogs = sortDailyLogsDesc(
-          logsRes.data.map((l: any) => ({
-            id: l.id,
-            log_date: l.log_date,
+          logsRes.data.map((l: Record<string, unknown>) => ({
+            id: String(l.id),
+            log_date: String(l.log_date),
             earnings: Number(l.earnings),
             km_start: Number(l.km_start),
             km_end: Number(l.km_end),
             km_total: Number(l.km_total),
-            start_time: l.start_time || '',
-            end_time: l.end_time || '',
-            notes: l.notes || '',
+            start_time: typeof l.start_time === 'string' ? l.start_time : '',
+            end_time: typeof l.end_time === 'string' ? l.end_time : '',
+            notes: typeof l.notes === 'string' ? l.notes : '',
           }))
         );
         setDailyLogs(mappedLogs);
@@ -323,18 +399,24 @@ export default function App() {
 
       if (unexpRes.data) {
         setUnexpectedExpenses(
-          unexpRes.data.map((u: any) => ({
-            id: u.id,
-            expense_date: u.expense_date,
-            description: u.description,
+          unexpRes.data.map((u: Record<string, unknown>) => ({
+            id: String(u.id),
+            expense_date: String(u.expense_date),
+            description: String(u.description),
             amount: Number(u.amount),
           }))
         );
       }
 
-      setAuthStatus('Dados sincronizados da nuvem Supabase com sucesso!');
-    } catch (err: any) {
-      setAuthStatus(`Erro ao buscar dados da nuvem: ${err.message || err}`);
+      setAuthStatus({
+        kind: 'success',
+        text: 'Dados sincronizados da nuvem Supabase com sucesso!',
+      });
+    } catch (err) {
+      setAuthStatus({
+        kind: 'error',
+        text: `Erro ao buscar dados da nuvem: ${getErrorMessage(err)}`,
+      });
     } finally {
       setSyncing(false);
     }
@@ -344,7 +426,10 @@ export default function App() {
     const client = getSupabaseClient();
     if (!client || !userId) return;
     setSyncing(true);
-    setAuthStatus('Enviando e sincronizando dados com o Supabase...');
+    setAuthStatus({
+      kind: 'info',
+      text: 'Enviando e sincronizando dados com o Supabase...',
+    });
     setCloudErrorBanner('');
     try {
       // 1. Upsert bike_settings
@@ -420,9 +505,15 @@ export default function App() {
       }
 
       await pullFromSupabase(userId);
-      setAuthStatus('Todos os dados locais e da planilha foram salvos com segurança no Supabase!');
-    } catch (err: any) {
-      setAuthStatus(`Falha ao sincronizar: ${err.message || err}`);
+      setAuthStatus({
+        kind: 'success',
+        text: 'Todos os dados locais foram salvos com segurança no Supabase!',
+      });
+    } catch (err) {
+      setAuthStatus({
+        kind: 'error',
+        text: `Falha ao sincronizar: ${getErrorMessage(err)}`,
+      });
     } finally {
       setSyncing(false);
     }
@@ -478,50 +569,96 @@ export default function App() {
 
   async function handleUndoDelete() {
     if (!undoData) return;
+    const payload = undoData;
     const client = getSupabaseClient();
-    if (undoData.kind === 'log') {
-      const log = undoData.item as DailyLog;
-      setDailyLogs((prev) => sortDailyLogsDesc([log, ...prev.filter((i) => i.id !== log.id)]));
+    setUndoData(null);
+
+    if (payload.kind === 'log') {
+      const log = payload.item as DailyLog;
+      const normalizedLog: DailyLog = { ...log, id: ensureValidUuid(log.id) };
+      setDailyLogs((prev) =>
+        sortDailyLogsDesc([normalizedLog, ...prev.filter((i) => i.id !== log.id && i.id !== normalizedLog.id)])
+      );
       if (client && userId) {
-        await client.from('daily_logs').upsert({
-          id: ensureValidUuid(log.id),
-          user_id: userId,
-          log_date: log.log_date,
-          earnings: log.earnings,
-          km_start: log.km_start,
-          km_end: log.km_end,
-          km_total: log.km_total,
-          start_time: log.start_time || null,
-          end_time: log.end_time || null,
-          notes: log.notes || null,
-        });
+        try {
+          const { error } = await client.from('daily_logs').upsert(
+            {
+              id: normalizedLog.id,
+              user_id: userId,
+              log_date: normalizedLog.log_date,
+              earnings: normalizedLog.earnings,
+              km_start: normalizedLog.km_start,
+              km_end: normalizedLog.km_end,
+              km_total: normalizedLog.km_total,
+              start_time: normalizedLog.start_time || null,
+              end_time: normalizedLog.end_time || null,
+              notes: normalizedLog.notes || null,
+            },
+            { onConflict: 'id' }
+          );
+          if (error) throw error;
+          setCloudErrorBanner('');
+        } catch (err) {
+          setCloudErrorBanner(
+            `Lançamento restaurado no aparelho, mas falhou ao restaurar na nuvem: ${getErrorMessage(err)}`
+          );
+        }
       }
-    } else if (undoData.kind === 'maint') {
-      const item = undoData.item as MaintenanceItem;
-      setMaintenanceItems((prev) => [...prev.filter((i) => i.id !== item.id), item]);
+    } else if (payload.kind === 'maint') {
+      const item = payload.item as MaintenanceItem;
+      const normalizedItem: MaintenanceItem = { ...item, id: ensureValidUuid(item.id) };
+      setMaintenanceItems((prev) => [
+        ...prev.filter((i) => i.id !== item.id && i.id !== normalizedItem.id),
+        normalizedItem,
+      ]);
       if (client && userId) {
-        await client.from('maintenance_items').upsert({
-          id: ensureValidUuid(item.id),
-          user_id: userId,
-          name: item.name,
-          cost: item.cost,
-          duration_km: item.duration_km,
-        });
+        try {
+          const { error } = await client.from('maintenance_items').upsert(
+            {
+              id: normalizedItem.id,
+              user_id: userId,
+              name: normalizedItem.name,
+              cost: normalizedItem.cost,
+              duration_km: normalizedItem.duration_km,
+            },
+            { onConflict: 'id' }
+          );
+          if (error) throw error;
+          setCloudErrorBanner('');
+        } catch (err) {
+          setCloudErrorBanner(
+            `Peça restaurada no aparelho, mas falhou ao restaurar na nuvem: ${getErrorMessage(err)}`
+          );
+        }
       }
-    } else if (undoData.kind === 'unexp') {
-      const exp = undoData.item as UnexpectedExpense;
-      setUnexpectedExpenses((prev) => [exp, ...prev.filter((i) => i.id !== exp.id)]);
+    } else if (payload.kind === 'unexp') {
+      const exp = payload.item as UnexpectedExpense;
+      const normalizedExp: UnexpectedExpense = { ...exp, id: ensureValidUuid(exp.id) };
+      setUnexpectedExpenses((prev) => [
+        normalizedExp,
+        ...prev.filter((i) => i.id !== exp.id && i.id !== normalizedExp.id),
+      ]);
       if (client && userId) {
-        await client.from('unexpected_expenses').upsert({
-          id: ensureValidUuid(exp.id),
-          user_id: userId,
-          expense_date: exp.expense_date,
-          description: exp.description,
-          amount: exp.amount,
-        });
+        try {
+          const { error } = await client.from('unexpected_expenses').upsert(
+            {
+              id: normalizedExp.id,
+              user_id: userId,
+              expense_date: normalizedExp.expense_date,
+              description: normalizedExp.description,
+              amount: normalizedExp.amount,
+            },
+            { onConflict: 'id' }
+          );
+          if (error) throw error;
+          setCloudErrorBanner('');
+        } catch (err) {
+          setCloudErrorBanner(
+            `Imprevisto restaurado no aparelho, mas falhou ao restaurar na nuvem: ${getErrorMessage(err)}`
+          );
+        }
       }
     }
-    setUndoData(null);
   }
 
   // Carregar um lançamento no formulário principal para edição
@@ -638,23 +775,29 @@ export default function App() {
     // Se estiver logado no Supabase, faz upsert com o mesmo UUID
     const client = getSupabaseClient();
     if (client && userId) {
-      const { error } = await client.from('daily_logs').upsert(
-        {
-          id: savedLog.id,
-          user_id: userId,
-          log_date: savedLog.log_date,
-          earnings: savedLog.earnings,
-          km_start: savedLog.km_start,
-          km_end: savedLog.km_end,
-          km_total: savedLog.km_total,
-          start_time: savedLog.start_time || null,
-          end_time: savedLog.end_time || null,
-          notes: savedLog.notes || null,
-        },
-        { onConflict: 'id' }
-      );
-      if (error) {
-        setCloudErrorBanner(`Salvo no aparelho, mas falhou na nuvem: ${error.message}`);
+      try {
+        const { error } = await client.from('daily_logs').upsert(
+          {
+            id: savedLog.id,
+            user_id: userId,
+            log_date: savedLog.log_date,
+            earnings: savedLog.earnings,
+            km_start: savedLog.km_start,
+            km_end: savedLog.km_end,
+            km_total: savedLog.km_total,
+            start_time: savedLog.start_time || null,
+            end_time: savedLog.end_time || null,
+            notes: savedLog.notes || null,
+          },
+          { onConflict: 'id' }
+        );
+        if (error) {
+          setCloudErrorBanner(`Salvo no aparelho, mas falhou na nuvem: ${error.message}`);
+        } else {
+          setCloudErrorBanner('');
+        }
+      } catch (err) {
+        setCloudErrorBanner(`Salvo no aparelho, mas falhou na nuvem: ${getErrorMessage(err)}`);
       }
     }
   }
@@ -712,23 +855,29 @@ export default function App() {
 
     const client = getSupabaseClient();
     if (client && userId) {
-      const { error } = await client.from('daily_logs').upsert(
-        {
-          id: updatedLog.id,
-          user_id: userId,
-          log_date: updatedLog.log_date,
-          earnings: updatedLog.earnings,
-          km_start: updatedLog.km_start,
-          km_end: updatedLog.km_end,
-          km_total: updatedLog.km_total,
-          start_time: updatedLog.start_time || null,
-          end_time: updatedLog.end_time || null,
-          notes: updatedLog.notes || null,
-        },
-        { onConflict: 'id' }
-      );
-      if (error) {
-        setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
+      try {
+        const { error } = await client.from('daily_logs').upsert(
+          {
+            id: updatedLog.id,
+            user_id: userId,
+            log_date: updatedLog.log_date,
+            earnings: updatedLog.earnings,
+            km_start: updatedLog.km_start,
+            km_end: updatedLog.km_end,
+            km_total: updatedLog.km_total,
+            start_time: updatedLog.start_time || null,
+            end_time: updatedLog.end_time || null,
+            notes: updatedLog.notes || null,
+          },
+          { onConflict: 'id' }
+        );
+        if (error) {
+          setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
+        } else {
+          setCloudErrorBanner('');
+        }
+      } catch (err) {
+        setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${getErrorMessage(err)}`);
       }
     }
   }
@@ -744,7 +893,19 @@ export default function App() {
 
     const client = getSupabaseClient();
     if (client && userId) {
-      await client.from('daily_logs').delete().eq('id', ensureValidUuid(log.id)).eq('user_id', userId);
+      try {
+        const { error } = await client
+          .from('daily_logs')
+          .delete()
+          .eq('id', ensureValidUuid(log.id))
+          .eq('user_id', userId);
+        if (error) throw error;
+        setCloudErrorBanner('');
+      } catch (err) {
+        setCloudErrorBanner(
+          `Lançamento excluído no aparelho, mas falhou ao excluir na nuvem: ${getErrorMessage(err)}`
+        );
+      }
     }
   }
 
@@ -778,18 +939,24 @@ export default function App() {
 
     const client = getSupabaseClient();
     if (client && userId) {
-      const { error } = await client.from('maintenance_items').upsert(
-        {
-          id: item.id,
-          user_id: userId,
-          name: item.name,
-          cost: item.cost,
-          duration_km: item.duration_km,
-        },
-        { onConflict: 'id' }
-      );
-      if (error) {
-        setCloudErrorBanner(`Peça salva no aparelho, mas falhou na nuvem: ${error.message}`);
+      try {
+        const { error } = await client.from('maintenance_items').upsert(
+          {
+            id: item.id,
+            user_id: userId,
+            name: item.name,
+            cost: item.cost,
+            duration_km: item.duration_km,
+          },
+          { onConflict: 'id' }
+        );
+        if (error) {
+          setCloudErrorBanner(`Peça salva no aparelho, mas falhou na nuvem: ${error.message}`);
+        } else {
+          setCloudErrorBanner('');
+        }
+      } catch (err) {
+        setCloudErrorBanner(`Peça salva no aparelho, mas falhou na nuvem: ${getErrorMessage(err)}`);
       }
     }
   }
@@ -825,18 +992,24 @@ export default function App() {
 
     const client = getSupabaseClient();
     if (client && userId) {
-      const { error } = await client.from('maintenance_items').upsert(
-        {
-          id: updated.id,
-          user_id: userId,
-          name: updated.name,
-          cost: updated.cost,
-          duration_km: updated.duration_km,
-        },
-        { onConflict: 'id' }
-      );
-      if (error) {
-        setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
+      try {
+        const { error } = await client.from('maintenance_items').upsert(
+          {
+            id: updated.id,
+            user_id: userId,
+            name: updated.name,
+            cost: updated.cost,
+            duration_km: updated.duration_km,
+          },
+          { onConflict: 'id' }
+        );
+        if (error) {
+          setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
+        } else {
+          setCloudErrorBanner('');
+        }
+      } catch (err) {
+        setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${getErrorMessage(err)}`);
       }
     }
   }
@@ -852,11 +1025,19 @@ export default function App() {
 
     const client = getSupabaseClient();
     if (client && userId) {
-      await client
-        .from('maintenance_items')
-        .delete()
-        .eq('id', ensureValidUuid(item.id))
-        .eq('user_id', userId);
+      try {
+        const { error } = await client
+          .from('maintenance_items')
+          .delete()
+          .eq('id', ensureValidUuid(item.id))
+          .eq('user_id', userId);
+        if (error) throw error;
+        setCloudErrorBanner('');
+      } catch (err) {
+        setCloudErrorBanner(
+          `Peça excluída no aparelho, mas falhou ao excluir na nuvem: ${getErrorMessage(err)}`
+        );
+      }
     }
   }
 
@@ -888,18 +1069,24 @@ export default function App() {
 
     const client = getSupabaseClient();
     if (client && userId) {
-      const { error } = await client.from('unexpected_expenses').upsert(
-        {
-          id: exp.id,
-          user_id: userId,
-          expense_date: exp.expense_date,
-          description: exp.description,
-          amount: exp.amount,
-        },
-        { onConflict: 'id' }
-      );
-      if (error) {
-        setCloudErrorBanner(`Imprevisto salvo no aparelho, mas falhou na nuvem: ${error.message}`);
+      try {
+        const { error } = await client.from('unexpected_expenses').upsert(
+          {
+            id: exp.id,
+            user_id: userId,
+            expense_date: exp.expense_date,
+            description: exp.description,
+            amount: exp.amount,
+          },
+          { onConflict: 'id' }
+        );
+        if (error) {
+          setCloudErrorBanner(`Imprevisto salvo no aparelho, mas falhou na nuvem: ${error.message}`);
+        } else {
+          setCloudErrorBanner('');
+        }
+      } catch (err) {
+        setCloudErrorBanner(`Imprevisto salvo no aparelho, mas falhou na nuvem: ${getErrorMessage(err)}`);
       }
     }
   }
@@ -934,18 +1121,24 @@ export default function App() {
 
     const client = getSupabaseClient();
     if (client && userId) {
-      const { error } = await client.from('unexpected_expenses').upsert(
-        {
-          id: updated.id,
-          user_id: userId,
-          expense_date: updated.expense_date,
-          description: updated.description,
-          amount: updated.amount,
-        },
-        { onConflict: 'id' }
-      );
-      if (error) {
-        setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
+      try {
+        const { error } = await client.from('unexpected_expenses').upsert(
+          {
+            id: updated.id,
+            user_id: userId,
+            expense_date: updated.expense_date,
+            description: updated.description,
+            amount: updated.amount,
+          },
+          { onConflict: 'id' }
+        );
+        if (error) {
+          setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
+        } else {
+          setCloudErrorBanner('');
+        }
+      } catch (err) {
+        setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${getErrorMessage(err)}`);
       }
     }
   }
@@ -961,11 +1154,19 @@ export default function App() {
 
     const client = getSupabaseClient();
     if (client && userId) {
-      await client
-        .from('unexpected_expenses')
-        .delete()
-        .eq('id', ensureValidUuid(exp.id))
-        .eq('user_id', userId);
+      try {
+        const { error } = await client
+          .from('unexpected_expenses')
+          .delete()
+          .eq('id', ensureValidUuid(exp.id))
+          .eq('user_id', userId);
+        if (error) throw error;
+        setCloudErrorBanner('');
+      } catch (err) {
+        setCloudErrorBanner(
+          `Imprevisto excluído no aparelho, mas falhou ao excluir na nuvem: ${getErrorMessage(err)}`
+        );
+      }
     }
   }
 
@@ -987,59 +1188,32 @@ export default function App() {
     return sortedDailyLogs.filter((l) => l.log_date.startsWith(selectedMonth));
   }, [sortedDailyLogs, selectedMonth]);
 
-  // Resumo geral do período selecionado
-  const summaryStats = useMemo(() => {
-    let totalGross = 0;
-    let totalKm = 0;
-    let totalHours = 0;
-    let totalFuel = 0;
-    let totalMaint = 0;
-
-    filteredLogs.forEach((l) => {
-      const m = calculateDayMetrics(l, settings, maintenanceItems, []);
-      totalGross += m.grossEarnings;
-      totalKm += m.kmRodado;
-      totalHours += m.hoursWorked;
-      totalFuel += m.fuelCost;
-      totalMaint += m.maintenanceCost;
-    });
-
-    const totalUnexpected = unexpectedExpenses
-      .filter((u) => selectedMonth === 'all' || u.expense_date.startsWith(selectedMonth))
-      .reduce((acc, cur) => acc + cur.amount, 0);
-
-    const totalCost = totalFuel + totalMaint + totalUnexpected;
-    const netProfit = totalGross - totalCost;
-    const avgGrossPerKm = totalKm > 0 ? totalGross / totalKm : 0;
-    const avgNetPerKm = totalKm > 0 ? netProfit / totalKm : 0;
-    const avgGrossPerHour = totalHours > 0 ? totalGross / totalHours : 0;
-
-    return {
-      daysCount: filteredLogs.length,
-      totalGross,
-      totalKm,
-      totalHours,
-      totalFuel,
-      totalMaint,
-      totalUnexpected,
-      totalCost,
-      netProfit,
-      avgGrossPerKm,
-      avgNetPerKm,
-      avgGrossPerHour,
-    };
-  }, [filteredLogs, settings, maintenanceItems, unexpectedExpenses, selectedMonth]);
+  // Resumo geral do período selecionado (avgGrossPerHour considera apenas dias com hoursWorked > 0)
+  const summaryStats = useMemo(
+    () =>
+      calculatePeriodSummary(
+        filteredLogs,
+        settings,
+        maintenanceItems,
+        unexpectedExpenses,
+        selectedMonth
+      ),
+    [filteredLogs, settings, maintenanceItems, unexpectedExpenses, selectedMonth]
+  );
 
   // Autenticação Supabase
   async function handleSupabaseAuth(e: React.FormEvent) {
     e.preventDefault();
     const client = getSupabaseClient();
     if (!client) {
-      setAuthStatus('Configure a URL e a Anon Key do Supabase primeiro.');
+      setAuthStatus({
+        kind: 'warning',
+        text: 'Sincronização em nuvem indisponível: configure VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY.',
+      });
       return;
     }
     setSyncing(true);
-    setAuthStatus('');
+    setAuthStatus(null);
     try {
       if (authMode === 'login') {
         const { data, error } = await client.auth.signInWithPassword({
@@ -1047,10 +1221,17 @@ export default function App() {
           password: authPasswordInput,
         });
         if (error) throw error;
-        if (data.user) {
-          setUserEmail(data.user.email ?? 'Logado');
-          setUserId(data.user.id);
-          await pullFromSupabase(data.user.id);
+        if (data.session?.user) {
+          setUserEmail(data.session.user.email ?? 'Logado');
+          setUserId(data.session.user.id);
+          await pullFromSupabase(data.session.user.id);
+        } else {
+          setUserEmail(null);
+          setUserId(null);
+          setAuthStatus({
+            kind: 'warning',
+            text: 'Não foi possível iniciar sessão ativa. Confirme seu e-mail e tente novamente.',
+          });
         }
       } else {
         const { data, error } = await client.auth.signUp({
@@ -1058,29 +1239,147 @@ export default function App() {
           password: authPasswordInput,
         });
         if (error) throw error;
-        if (data.user) {
-          setUserEmail(data.user.email ?? 'Logado');
-          setUserId(data.user.id);
-          setAuthStatus(
-            'Conta criada! Clique em "Enviar Dados Locais / Planilha para a Nuvem" para salvar seu histórico.'
-          );
+        if (data.session?.user) {
+          setUserEmail(data.session.user.email ?? 'Logado');
+          setUserId(data.session.user.id);
+          setAuthStatus({
+            kind: 'success',
+            text: 'Conta criada e conectada! Clique em "Sincronizar Dados com a Nuvem" para salvar seu histórico.',
+          });
+        } else if (data.user) {
+          setUserEmail(null);
+          setUserId(null);
+          setAuthStatus({
+            kind: 'warning',
+            text: 'Cadastro criado! Verifique sua caixa de entrada e confirme seu e-mail antes de fazer login.',
+          });
+        } else {
+          setUserEmail(null);
+          setUserId(null);
+          setAuthStatus({
+            kind: 'warning',
+            text: 'Não foi possível concluir o cadastro agora. Tente novamente.',
+          });
         }
       }
-    } catch (err: any) {
-      setAuthStatus(`Erro: ${err.message || err}`);
+    } catch (err) {
+      setAuthStatus({
+        kind: 'error',
+        text: `Erro: ${getErrorMessage(err)}`,
+      });
     } finally {
       setSyncing(false);
     }
   }
 
   async function handleLogout() {
+    let signOutError: string | null = null;
     const client = getSupabaseClient();
     if (client) {
-      await client.auth.signOut();
+      try {
+        const { error } = await client.auth.signOut();
+        if (error) {
+          signOutError = error.message;
+        }
+      } catch (err) {
+        signOutError = getErrorMessage(err);
+      }
     }
+
+    // Limpa todas as chaves do MotoLucro (atuais e legadas) do localStorage
+    localStorage.removeItem(LS_SETTINGS_KEY);
+    localStorage.removeItem(LS_MAINT_KEY);
+    localStorage.removeItem(LS_LOGS_KEY);
+    localStorage.removeItem(LS_UNEXPECTED_KEY);
+    localStorage.removeItem(LS_LEGACY_SUPABASE_URL_KEY);
+    localStorage.removeItem(LS_LEGACY_SUPABASE_ANON_KEY);
+
+    // Impede os effects de regravarem os dados demo logo após a limpeza
+    skipPersistRef.current = {
+      settings: true,
+      maint: true,
+      logs: true,
+      unexp: true,
+    };
+
+    const demoSettings = createDemoSettings();
+    const demoMaintenance = createDemoMaintenanceItems();
+    const demoLogs = createDemoDailyLogs();
+    const demoUnexpected = createDemoUnexpectedExpenses();
+    const demoLatestKm = demoLogs.find((l) => l.km_end > 0)?.km_end ?? 0;
+    const freshToday = getLocalTodayStr();
+
+    // Reseta todo o estado React para o estado demo limpo
     setUserEmail(null);
     setUserId(null);
-    setAuthStatus('Sessão encerrada. Seus dados continuam salvos no aparelho.');
+    setAuthEmailInput('');
+    setAuthPasswordInput('');
+    setAuthMode('login');
+    setCloudErrorBanner('');
+
+    setSettings(demoSettings);
+    setFuelConsumptionInput(String(demoSettings.fuel_consumption_km_l));
+    setFuelPriceInput(String(demoSettings.fuel_price_per_liter));
+    setSettingsSavedToast(false);
+
+    setMaintenanceItems(demoMaintenance);
+    setDailyLogs(demoLogs);
+    setUnexpectedExpenses(demoUnexpected);
+    setSelectedMonth('all');
+
+    setUndoData(null);
+    setConfirmDeleteId(null);
+
+    setEditingMainLogId(null);
+    setLogDate(freshToday);
+    setKmStart(demoLatestKm > 0 ? String(demoLatestKm) : '');
+    setKmEnd('');
+    setEarnings('');
+    setStartTime('');
+    setEndTime('');
+    setFormError('');
+    setSaveToast('');
+
+    setHistEditId(null);
+    setHistEditDate('');
+    setHistEditEarnings('');
+    setHistEditKmStart('');
+    setHistEditKmEnd('');
+    setHistEditStartTime('');
+    setHistEditEndTime('');
+    setHistEditError('');
+
+    setMaintEditId(null);
+    setMaintEditName('');
+    setMaintEditCost('');
+    setMaintEditDuration('');
+    setMaintEditError('');
+    setNewMaintName('');
+    setNewMaintCost('');
+    setNewMaintDuration('');
+    setMaintFormError('');
+
+    setUnexpEditId(null);
+    setUnexpEditDate('');
+    setUnexpEditDesc('');
+    setUnexpEditAmount('');
+    setUnexpEditError('');
+    setUnexpDate(freshToday);
+    setUnexpDesc('');
+    setUnexpAmount('');
+    setUnexpFormError('');
+
+    if (signOutError) {
+      setAuthStatus({
+        kind: 'warning',
+        text: `Dados locais limpos, mas houve falha ao encerrar sessão na nuvem: ${signOutError}`,
+      });
+    } else {
+      setAuthStatus({
+        kind: 'info',
+        text: 'Sessão encerrada e dados da conta removidos deste aparelho.',
+      });
+    }
   }
 
   function handleExportBackup() {
@@ -1100,6 +1399,13 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
+  const authStatusClasses: Record<AuthStatusKind, string> = {
+    success: 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300',
+    info: 'bg-sky-950/40 border-sky-500/30 text-sky-200',
+    warning: 'bg-amber-950/50 border-amber-500/40 text-amber-200',
+    error: 'bg-rose-950/60 border-rose-500/40 text-rose-200',
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 pb-24">
       {/* Top Bar */}
@@ -1107,7 +1413,7 @@ export default function App() {
         <div className="max-w-3xl mx-auto flex items-center justify-between gap-2">
           <div className="flex items-center gap-2.5 min-w-0">
             <div className="w-10 h-10 shrink-0 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-              <Bike className="w-6 h-6" />
+              <Bike className="w-6 h-6" aria-hidden="true" />
             </div>
             <div className="min-w-0">
               <h1 className="font-bold text-lg leading-tight tracking-tight text-white flex flex-wrap items-center gap-2">
@@ -1123,6 +1429,7 @@ export default function App() {
           </div>
 
           <button
+            type="button"
             onClick={() => setActiveTab('nuvem')}
             className={`shrink-0 flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border transition ${
               userEmail
@@ -1130,7 +1437,7 @@ export default function App() {
                 : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-800'
             }`}
           >
-            <User className="w-3.5 h-3.5" />
+            <User className="w-3.5 h-3.5" aria-hidden="true" />
             {userEmail ? 'Sincronizado' : 'Minha Conta'}
           </button>
         </div>
@@ -1139,7 +1446,10 @@ export default function App() {
       {/* Banner de Desfazer Exclusão (Undo) */}
       {undoData && (
         <div className="max-w-3xl mx-auto px-4 pt-3">
-          <div className="bg-slate-900 border border-amber-500/40 rounded-xl px-4 py-2.5 flex items-center justify-between gap-3 shadow-lg">
+          <div
+            role="status"
+            className="bg-slate-900 border border-amber-500/40 rounded-xl px-4 py-2.5 flex items-center justify-between gap-3 shadow-lg"
+          >
             <span className="text-xs text-slate-200">
               Excluído: <strong className="text-white">{undoData.label}</strong>
             </span>
@@ -1149,15 +1459,16 @@ export default function App() {
                 onClick={handleUndoDelete}
                 className="flex items-center gap-1 text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 px-3 py-1.5 rounded-lg transition"
               >
-                <RotateCcw className="w-3.5 h-3.5" /> Desfazer
+                <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" /> Desfazer
               </button>
               <button
                 type="button"
                 onClick={() => setUndoData(null)}
                 className="p-1 text-slate-400 hover:text-slate-200"
                 title="Fechar aviso"
+                aria-label="Fechar aviso de desfazer"
               >
-                <X className="w-4 h-4" />
+                <X className="w-4 h-4" aria-hidden="true" />
               </button>
             </div>
           </div>
@@ -1167,14 +1478,22 @@ export default function App() {
       {/* Aviso de erro de sincronização com a nuvem */}
       {cloudErrorBanner && (
         <div className="max-w-3xl mx-auto px-4 pt-3">
-          <div className="bg-rose-950/60 border border-rose-500/40 rounded-xl px-4 py-2.5 flex items-center justify-between gap-2 text-xs text-rose-200">
-            <span>{cloudErrorBanner}</span>
+          <div
+            role="alert"
+            className="bg-rose-950/60 border border-rose-500/40 rounded-xl px-4 py-2.5 flex items-center justify-between gap-2 text-xs text-rose-200"
+          >
+            <span className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true" />
+              <span>{cloudErrorBanner}</span>
+            </span>
             <button
               type="button"
               onClick={() => setCloudErrorBanner('')}
               className="text-rose-300 hover:text-white p-1"
+              title="Fechar aviso de erro"
+              aria-label="Fechar aviso de erro"
             >
-              <X className="w-4 h-4" />
+              <X className="w-4 h-4" aria-hidden="true" />
             </button>
           </div>
         </div>
@@ -1211,7 +1530,10 @@ export default function App() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                   <div>
                     <div className="flex items-center justify-between gap-1 mb-1.5">
-                      <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      <label
+                        htmlFor="log-date"
+                        className="block text-xs font-semibold uppercase tracking-wider text-slate-400"
+                      >
                         Data da Corrida
                       </label>
                       {editingMainLogId && (
@@ -1222,6 +1544,7 @@ export default function App() {
                     </div>
                     <div className="relative">
                       <input
+                        id="log-date"
                         type="date"
                         required
                         value={logDate}
@@ -1232,14 +1555,21 @@ export default function App() {
                   </div>
 
                   <div>
-                    <label className="block text-xs font-semibold uppercase tracking-wider text-emerald-400 mb-1.5">
+                    <label
+                      htmlFor="log-earnings"
+                      className="block text-xs font-semibold uppercase tracking-wider text-emerald-400 mb-1.5"
+                    >
                       Valor Obtido no Dia (R$) *
                     </label>
                     <div className="relative">
-                      <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-semibold">
+                      <span
+                        aria-hidden="true"
+                        className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-semibold"
+                      >
                         R$
                       </span>
                       <input
+                        id="log-earnings"
                         type="number"
                         step="0.01"
                         inputMode="decimal"
@@ -1260,7 +1590,10 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-3.5">
                   <div>
                     <div className="flex items-center justify-between gap-1 mb-1.5">
-                      <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      <label
+                        htmlFor="log-km-start"
+                        className="block text-xs font-semibold uppercase tracking-wider text-slate-400"
+                      >
                         KM Inicial *
                       </label>
                       {latestKmEnd > 0 && kmStart !== String(latestKmEnd) && (
@@ -1277,11 +1610,12 @@ export default function App() {
                       )}
                     </div>
                     <input
+                      id="log-km-start"
                       type="number"
                       step="0.1"
                       inputMode="decimal"
                       required
-                      placeholder="Ex: 1835.0"
+                      placeholder="Ex: 10000.0"
                       value={kmStart}
                       onChange={(e) => {
                         setKmStart(e.target.value);
@@ -1292,15 +1626,19 @@ export default function App() {
                   </div>
 
                   <div>
-                    <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                    <label
+                      htmlFor="log-km-end"
+                      className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5"
+                    >
                       KM Final *
                     </label>
                     <input
+                      id="log-km-end"
                       type="number"
                       step="0.1"
                       inputMode="decimal"
                       required
-                      placeholder="Ex: 1980.0"
+                      placeholder="Ex: 10120.0"
                       value={kmEnd}
                       onChange={(e) => {
                         setKmEnd(e.target.value);
@@ -1315,8 +1653,11 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-3.5 pt-1">
                   <div>
                     <div className="flex items-center justify-between mb-1">
-                      <label className="text-xs font-medium text-slate-400 flex items-center gap-1">
-                        <Clock className="w-3.5 h-3.5 text-slate-500" /> Hora Início
+                      <label
+                        htmlFor="log-start-time"
+                        className="text-xs font-medium text-slate-400 flex items-center gap-1"
+                      >
+                        <Clock className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" /> Hora Início
                       </label>
                       <button
                         type="button"
@@ -1327,6 +1668,7 @@ export default function App() {
                       </button>
                     </div>
                     <input
+                      id="log-start-time"
                       type="time"
                       value={startTime}
                       onChange={(e) => setStartTime(e.target.value)}
@@ -1336,8 +1678,11 @@ export default function App() {
 
                   <div>
                     <div className="flex items-center justify-between mb-1">
-                      <label className="text-xs font-medium text-slate-400 flex items-center gap-1">
-                        <Clock className="w-3.5 h-3.5 text-slate-500" /> Hora Fim
+                      <label
+                        htmlFor="log-end-time"
+                        className="text-xs font-medium text-slate-400 flex items-center gap-1"
+                      >
+                        <Clock className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" /> Hora Fim
                       </label>
                       <button
                         type="button"
@@ -1348,6 +1693,7 @@ export default function App() {
                       </button>
                     </div>
                     <input
+                      id="log-end-time"
                       type="time"
                       value={endTime}
                       onChange={(e) => setEndTime(e.target.value)}
@@ -1421,7 +1767,7 @@ export default function App() {
                     role="alert"
                     className="flex items-center gap-2 text-rose-300 text-xs font-medium bg-rose-500/10 border border-rose-500/30 px-3.5 py-2.5 rounded-xl"
                   >
-                    <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                    <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true" />
                     <span>{formError}</span>
                   </div>
                 )}
@@ -1431,7 +1777,7 @@ export default function App() {
                     type="submit"
                     className="flex-1 bg-emerald-500 hover:bg-emerald-400 active:scale-[0.99] text-slate-950 font-bold text-base py-3.5 rounded-xl shadow-lg shadow-emerald-500/10 flex items-center justify-center gap-2 transition"
                   >
-                    <PlusCircle className="w-5 h-5" />
+                    <PlusCircle className="w-5 h-5" aria-hidden="true" />
                     {editingMainLogId ? 'Salvar Alterações do Dia' : 'Salvar Fechamento do Dia'}
                   </button>
 
@@ -1447,8 +1793,11 @@ export default function App() {
                 </div>
 
                 {saveToast && (
-                  <div className="flex items-center justify-center gap-2 text-emerald-400 text-sm font-medium bg-emerald-500/10 border border-emerald-500/20 py-2 px-3 rounded-lg">
-                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  <div
+                    role="status"
+                    className="flex items-center justify-center gap-2 text-emerald-400 text-sm font-medium bg-emerald-500/10 border border-emerald-500/20 py-2 px-3 rounded-lg"
+                  >
+                    <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
                     <span>{saveToast}</span>
                   </div>
                 )}
@@ -1462,6 +1811,7 @@ export default function App() {
                   Últimos Dias Registrados
                 </h3>
                 <button
+                  type="button"
                   onClick={() => setActiveTab('historico')}
                   className="text-xs text-emerald-400 hover:underline font-medium"
                 >
@@ -1520,10 +1870,10 @@ export default function App() {
                           type="button"
                           onClick={() => startEditInMainForm(log)}
                           title="Editar registro"
-                          aria-label="Editar registro"
+                          aria-label={`Editar registro de ${formatDateBR(log.log_date)}`}
                           className="flex items-center gap-1 text-xs text-slate-300 hover:text-emerald-400 bg-slate-800/80 hover:bg-slate-800 border border-slate-700 px-2.5 py-1.5 rounded-lg transition"
                         >
-                          <Pencil className="w-3.5 h-3.5" />
+                          <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
                           <span>Editar</span>
                         </button>
                       </div>
@@ -1541,9 +1891,12 @@ export default function App() {
             {/* Filtro de Mês e Exportação */}
             <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900 border border-slate-800 p-4 rounded-2xl">
               <div className="flex items-center gap-2">
-                <Calendar className="w-4 h-4 text-emerald-400" />
-                <span className="text-sm font-semibold">Período:</span>
+                <Calendar className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+                <label htmlFor="history-month-filter" className="text-sm font-semibold">
+                  Período:
+                </label>
                 <select
+                  id="history-month-filter"
                   value={selectedMonth}
                   onChange={(e) => setSelectedMonth(e.target.value)}
                   className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white outline-none"
@@ -1558,10 +1911,11 @@ export default function App() {
               </div>
 
               <button
+                type="button"
                 onClick={handleExportBackup}
                 className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg border border-slate-700 transition"
               >
-                <Download className="w-3.5 h-3.5" />
+                <Download className="w-3.5 h-3.5" aria-hidden="true" />
                 Exportar Backup JSON
               </button>
             </div>
@@ -1639,14 +1993,20 @@ export default function App() {
                             onClick={() => setHistEditId(null)}
                             className="text-xs text-slate-400 hover:text-white flex items-center gap-1"
                           >
-                            <X className="w-3.5 h-3.5" /> Fechar
+                            <X className="w-3.5 h-3.5" aria-hidden="true" /> Fechar
                           </button>
                         </div>
 
                         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
                           <div>
-                            <label className="block text-[11px] text-slate-400 mb-1">Data</label>
+                            <label
+                              htmlFor={`hist-edit-date-${log.id}`}
+                              className="block text-[11px] text-slate-400 mb-1"
+                            >
+                              Data
+                            </label>
                             <input
+                              id={`hist-edit-date-${log.id}`}
                               type="date"
                               required
                               value={histEditDate}
@@ -1655,10 +2015,14 @@ export default function App() {
                             />
                           </div>
                           <div>
-                            <label className="block text-[11px] text-emerald-400 font-semibold mb-1">
+                            <label
+                              htmlFor={`hist-edit-earnings-${log.id}`}
+                              className="block text-[11px] text-emerald-400 font-semibold mb-1"
+                            >
                               Valor Bruto (R$)
                             </label>
                             <input
+                              id={`hist-edit-earnings-${log.id}`}
                               type="number"
                               step="0.01"
                               required
@@ -1668,8 +2032,14 @@ export default function App() {
                             />
                           </div>
                           <div>
-                            <label className="block text-[11px] text-slate-400 mb-1">KM Inicial</label>
+                            <label
+                              htmlFor={`hist-edit-km-start-${log.id}`}
+                              className="block text-[11px] text-slate-400 mb-1"
+                            >
+                              KM Inicial
+                            </label>
                             <input
+                              id={`hist-edit-km-start-${log.id}`}
                               type="number"
                               step="0.1"
                               required
@@ -1679,8 +2049,14 @@ export default function App() {
                             />
                           </div>
                           <div>
-                            <label className="block text-[11px] text-slate-400 mb-1">KM Final</label>
+                            <label
+                              htmlFor={`hist-edit-km-end-${log.id}`}
+                              className="block text-[11px] text-slate-400 mb-1"
+                            >
+                              KM Final
+                            </label>
                             <input
+                              id={`hist-edit-km-end-${log.id}`}
                               type="number"
                               step="0.1"
                               required
@@ -1690,8 +2066,14 @@ export default function App() {
                             />
                           </div>
                           <div>
-                            <label className="block text-[11px] text-slate-400 mb-1">Hora Início</label>
+                            <label
+                              htmlFor={`hist-edit-start-time-${log.id}`}
+                              className="block text-[11px] text-slate-400 mb-1"
+                            >
+                              Hora Início
+                            </label>
                             <input
+                              id={`hist-edit-start-time-${log.id}`}
                               type="time"
                               value={histEditStartTime}
                               onChange={(e) => setHistEditStartTime(e.target.value)}
@@ -1699,8 +2081,14 @@ export default function App() {
                             />
                           </div>
                           <div>
-                            <label className="block text-[11px] text-slate-400 mb-1">Hora Fim</label>
+                            <label
+                              htmlFor={`hist-edit-end-time-${log.id}`}
+                              className="block text-[11px] text-slate-400 mb-1"
+                            >
+                              Hora Fim
+                            </label>
                             <input
+                              id={`hist-edit-end-time-${log.id}`}
                               type="time"
                               value={histEditEndTime}
                               onChange={(e) => setHistEditEndTime(e.target.value)}
@@ -1710,7 +2098,10 @@ export default function App() {
                         </div>
 
                         {histEditError && (
-                          <div className="text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 px-3 py-2 rounded-lg">
+                          <div
+                            role="alert"
+                            className="text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 px-3 py-2 rounded-lg"
+                          >
                             {histEditError}
                           </div>
                         )}
@@ -1818,20 +2209,20 @@ export default function App() {
                               type="button"
                               onClick={() => startInlineHistoryEdit(log)}
                               title="Editar registro"
-                              aria-label="Editar registro"
+                              aria-label={`Editar registro de ${formatDateBR(log.log_date)}`}
                               className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-300 hover:text-emerald-400 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700 transition"
                             >
-                              <Pencil className="w-3.5 h-3.5" />
+                              <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
                               <span>Editar</span>
                             </button>
                             <button
                               type="button"
                               onClick={() => setConfirmDeleteId(log.id)}
                               title="Excluir registro"
-                              aria-label="Excluir registro"
+                              aria-label={`Excluir registro de ${formatDateBR(log.log_date)}`}
                               className="p-2 text-slate-500 hover:text-rose-400 rounded-lg hover:bg-slate-800 transition"
                             >
-                              <Trash2 className="w-4 h-4" />
+                              <Trash2 className="w-4 h-4" aria-hidden="true" />
                             </button>
                           </div>
                         )}
@@ -1851,7 +2242,7 @@ export default function App() {
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2.5">
-                  <Fuel className="w-5 h-5 text-emerald-400" />
+                  <Fuel className="w-5 h-5 text-emerald-400" aria-hidden="true" />
                   <div>
                     <h2 className="text-base font-bold text-white">Consumo da Moto & Gasolina</h2>
                     <p className="text-xs text-slate-400">
@@ -1870,10 +2261,11 @@ export default function App() {
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
                 <div>
-                  <label className="block text-xs font-medium text-slate-400 mb-1">
+                  <label htmlFor="bike-name" className="block text-xs font-medium text-slate-400 mb-1">
                     Modelo / Apelido da Moto
                   </label>
                   <input
+                    id="bike-name"
                     type="text"
                     value={settings.bike_name}
                     onChange={(e) => setSettings({ ...settings, bike_name: e.target.value })}
@@ -1883,13 +2275,17 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-slate-400 mb-1">
+                  <label
+                    htmlFor="bike-fuel-consumption"
+                    className="block text-xs font-medium text-slate-400 mb-1"
+                  >
                     Consumo Médio (KM por Litro)
                   </label>
                   <input
+                    id="bike-fuel-consumption"
                     type="text"
                     inputMode="decimal"
-                    placeholder="Ex: 30"
+                    placeholder="Ex: 35"
                     value={fuelConsumptionInput}
                     onChange={(e) => {
                       const raw = e.target.value;
@@ -1915,13 +2311,14 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-slate-400 mb-1">
+                  <label htmlFor="bike-fuel-price" className="block text-xs font-medium text-slate-400 mb-1">
                     Preço Médio Gasolina (R$/Litro)
                   </label>
                   <input
+                    id="bike-fuel-price"
                     type="text"
                     inputMode="decimal"
-                    placeholder="Ex: 5,89"
+                    placeholder="Ex: 6,00"
                     value={fuelPriceInput}
                     onChange={(e) => {
                       const raw = e.target.value;
@@ -1959,7 +2356,7 @@ export default function App() {
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2.5">
-                  <Wrench className="w-5 h-5 text-emerald-400" />
+                  <Wrench className="w-5 h-5 text-emerald-400" aria-hidden="true" />
                   <div>
                     <h2 className="text-base font-bold text-white">
                       Peças e Manutenção Preventiva por KM
@@ -1993,8 +2390,14 @@ export default function App() {
                       >
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                           <div>
-                            <label className="block text-[11px] text-slate-400 mb-1">Peça / Item</label>
+                            <label
+                              htmlFor={`maint-edit-name-${item.id}`}
+                              className="block text-[11px] text-slate-400 mb-1"
+                            >
+                              Peça / Item
+                            </label>
                             <input
+                              id={`maint-edit-name-${item.id}`}
                               type="text"
                               required
                               value={maintEditName}
@@ -2003,8 +2406,14 @@ export default function App() {
                             />
                           </div>
                           <div>
-                            <label className="block text-[11px] text-slate-400 mb-1">Valor (R$)</label>
+                            <label
+                              htmlFor={`maint-edit-cost-${item.id}`}
+                              className="block text-[11px] text-slate-400 mb-1"
+                            >
+                              Valor (R$)
+                            </label>
                             <input
+                              id={`maint-edit-cost-${item.id}`}
                               type="number"
                               step="0.01"
                               required
@@ -2014,8 +2423,14 @@ export default function App() {
                             />
                           </div>
                           <div>
-                            <label className="block text-[11px] text-slate-400 mb-1">Duração (KM)</label>
+                            <label
+                              htmlFor={`maint-edit-duration-${item.id}`}
+                              className="block text-[11px] text-slate-400 mb-1"
+                            >
+                              Duração (KM)
+                            </label>
                             <input
+                              id={`maint-edit-duration-${item.id}`}
                               type="number"
                               step="1"
                               required
@@ -2027,7 +2442,9 @@ export default function App() {
                         </div>
 
                         {maintEditError && (
-                          <div className="text-xs text-rose-300">{maintEditError}</div>
+                          <div role="alert" className="text-xs text-rose-300">
+                            {maintEditError}
+                          </div>
                         )}
 
                         <div className="flex items-center gap-2">
@@ -2095,20 +2512,20 @@ export default function App() {
                               type="button"
                               onClick={() => startInlineMaintEdit(item)}
                               title="Editar peça"
-                              aria-label="Editar peça"
+                              aria-label={`Editar peça ${item.name}`}
                               className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-emerald-400 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 transition"
                             >
-                              <Pencil className="w-3.5 h-3.5" />
+                              <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
                               <span>Editar</span>
                             </button>
                             <button
                               type="button"
                               onClick={() => setConfirmDeleteId(item.id)}
                               title="Excluir peça"
-                              aria-label="Excluir peça"
+                              aria-label={`Excluir peça ${item.name}`}
                               className="p-1.5 text-slate-500 hover:text-rose-400 rounded-lg"
                             >
-                              <Trash2 className="w-4 h-4" />
+                              <Trash2 className="w-4 h-4" aria-hidden="true" />
                             </button>
                           </div>
                         )}
@@ -2124,35 +2541,56 @@ export default function App() {
                   Adicionar Nova Despesa por KM
                 </h3>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                  <input
-                    type="text"
-                    required
-                    placeholder="Item (ex: Óleo + Filtro)"
-                    value={newMaintName}
-                    onChange={(e) => setNewMaintName(e.target.value)}
-                    className="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
-                  />
-                  <input
-                    type="number"
-                    step="0.01"
-                    required
-                    placeholder="Valor (R$ ex: 120)"
-                    value={newMaintCost}
-                    onChange={(e) => setNewMaintCost(e.target.value)}
-                    className="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
-                  />
-                  <input
-                    type="number"
-                    step="1"
-                    required
-                    placeholder="Duração KM (ex: 3000)"
-                    value={newMaintDuration}
-                    onChange={(e) => setNewMaintDuration(e.target.value)}
-                    className="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
-                  />
+                  <div>
+                    <label htmlFor="new-maint-name" className="block text-[11px] text-slate-400 mb-1">
+                      Peça / Item
+                    </label>
+                    <input
+                      id="new-maint-name"
+                      type="text"
+                      required
+                      placeholder="Ex: Óleo + Filtro"
+                      value={newMaintName}
+                      onChange={(e) => setNewMaintName(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="new-maint-cost" className="block text-[11px] text-slate-400 mb-1">
+                      Valor (R$)
+                    </label>
+                    <input
+                      id="new-maint-cost"
+                      type="number"
+                      step="0.01"
+                      required
+                      placeholder="Ex: 120"
+                      value={newMaintCost}
+                      onChange={(e) => setNewMaintCost(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="new-maint-duration" className="block text-[11px] text-slate-400 mb-1">
+                      Duração (KM)
+                    </label>
+                    <input
+                      id="new-maint-duration"
+                      type="number"
+                      step="1"
+                      required
+                      placeholder="Ex: 3000"
+                      value={newMaintDuration}
+                      onChange={(e) => setNewMaintDuration(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
+                    />
+                  </div>
                 </div>
                 {maintFormError && (
-                  <div className="text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 px-3 py-2 rounded-lg">
+                  <div
+                    role="alert"
+                    className="text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 px-3 py-2 rounded-lg"
+                  >
                     {maintFormError}
                   </div>
                 )}
@@ -2172,7 +2610,7 @@ export default function App() {
           <div className="space-y-5">
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
               <div className="flex items-center gap-2.5">
-                <AlertTriangle className="w-5 h-5 text-rose-400" />
+                <AlertTriangle className="w-5 h-5 text-rose-400" aria-hidden="true" />
                 <div>
                   <h2 className="text-base font-bold text-white">
                     Gastos Inesperados / Manutenção Extra
@@ -2184,42 +2622,63 @@ export default function App() {
               </div>
 
               <form onSubmit={handleAddUnexpected} className="space-y-2.5">
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <input
-                    type="date"
-                    required
-                    value={unexpDate}
-                    onChange={(e) => setUnexpDate(e.target.value)}
-                    className="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
-                  />
-                  <input
-                    type="text"
-                    required
-                    placeholder="O que aconteceu? (ex: Cabo embreagem)"
-                    value={unexpDesc}
-                    onChange={(e) => setUnexpDesc(e.target.value)}
-                    className="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
-                  />
-                  <div className="flex gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+                  <div>
+                    <label htmlFor="unexp-date" className="block text-[11px] text-slate-400 mb-1">
+                      Data do Imprevisto
+                    </label>
                     <input
-                      type="number"
-                      step="0.01"
+                      id="unexp-date"
+                      type="date"
                       required
-                      placeholder="Valor R$"
-                      value={unexpAmount}
-                      onChange={(e) => setUnexpAmount(e.target.value)}
+                      value={unexpDate}
+                      onChange={(e) => setUnexpDate(e.target.value)}
                       className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
                     />
-                    <button
-                      type="submit"
-                      className="px-4 bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-sm rounded-xl shrink-0 transition"
-                    >
-                      Salvar
-                    </button>
+                  </div>
+                  <div>
+                    <label htmlFor="unexp-desc" className="block text-[11px] text-slate-400 mb-1">
+                      Descrição
+                    </label>
+                    <input
+                      id="unexp-desc"
+                      type="text"
+                      required
+                      placeholder="Ex: Cabo de embreagem"
+                      value={unexpDesc}
+                      onChange={(e) => setUnexpDesc(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="unexp-amount" className="block text-[11px] text-slate-400 mb-1">
+                      Valor (R$)
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        id="unexp-amount"
+                        type="number"
+                        step="0.01"
+                        required
+                        placeholder="Ex: 45,00"
+                        value={unexpAmount}
+                        onChange={(e) => setUnexpAmount(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white outline-none"
+                      />
+                      <button
+                        type="submit"
+                        className="px-4 bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-sm rounded-xl shrink-0 transition"
+                      >
+                        Salvar
+                      </button>
+                    </div>
                   </div>
                 </div>
                 {unexpFormError && (
-                  <div className="text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 px-3 py-2 rounded-lg">
+                  <div
+                    role="alert"
+                    className="text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 px-3 py-2 rounded-lg"
+                  >
                     {unexpFormError}
                   </div>
                 )}
@@ -2243,31 +2702,60 @@ export default function App() {
                           className="p-4 bg-slate-900/90 space-y-3 border-l-2 border-rose-500"
                         >
                           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                            <input
-                              type="date"
-                              required
-                              value={unexpEditDate}
-                              onChange={(e) => setUnexpEditDate(e.target.value)}
-                              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white"
-                            />
-                            <input
-                              type="text"
-                              required
-                              value={unexpEditDesc}
-                              onChange={(e) => setUnexpEditDesc(e.target.value)}
-                              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white"
-                            />
-                            <input
-                              type="number"
-                              step="0.01"
-                              required
-                              value={unexpEditAmount}
-                              onChange={(e) => setUnexpEditAmount(e.target.value)}
-                              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white"
-                            />
+                            <div>
+                              <label
+                                htmlFor={`unexp-edit-date-${u.id}`}
+                                className="block text-[11px] text-slate-400 mb-1"
+                              >
+                                Data
+                              </label>
+                              <input
+                                id={`unexp-edit-date-${u.id}`}
+                                type="date"
+                                required
+                                value={unexpEditDate}
+                                onChange={(e) => setUnexpEditDate(e.target.value)}
+                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white"
+                              />
+                            </div>
+                            <div>
+                              <label
+                                htmlFor={`unexp-edit-desc-${u.id}`}
+                                className="block text-[11px] text-slate-400 mb-1"
+                              >
+                                Descrição
+                              </label>
+                              <input
+                                id={`unexp-edit-desc-${u.id}`}
+                                type="text"
+                                required
+                                value={unexpEditDesc}
+                                onChange={(e) => setUnexpEditDesc(e.target.value)}
+                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white"
+                              />
+                            </div>
+                            <div>
+                              <label
+                                htmlFor={`unexp-edit-amount-${u.id}`}
+                                className="block text-[11px] text-slate-400 mb-1"
+                              >
+                                Valor (R$)
+                              </label>
+                              <input
+                                id={`unexp-edit-amount-${u.id}`}
+                                type="number"
+                                step="0.01"
+                                required
+                                value={unexpEditAmount}
+                                onChange={(e) => setUnexpEditAmount(e.target.value)}
+                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white"
+                              />
+                            </div>
                           </div>
                           {unexpEditError && (
-                            <div className="text-xs text-rose-300">{unexpEditError}</div>
+                            <div role="alert" className="text-xs text-rose-300">
+                              {unexpEditError}
+                            </div>
                           )}
                           <div className="flex items-center gap-2">
                             <button
@@ -2330,20 +2818,20 @@ export default function App() {
                                 type="button"
                                 onClick={() => startInlineUnexpEdit(u)}
                                 title="Editar imprevisto"
-                                aria-label="Editar imprevisto"
+                                aria-label={`Editar imprevisto ${u.description}`}
                                 className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-emerald-400 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 transition"
                               >
-                                <Pencil className="w-3.5 h-3.5" />
+                                <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
                                 <span>Editar</span>
                               </button>
                               <button
                                 type="button"
                                 onClick={() => setConfirmDeleteId(u.id)}
                                 title="Excluir imprevisto"
-                                aria-label="Excluir imprevisto"
+                                aria-label={`Excluir imprevisto ${u.description}`}
                                 className="p-1.5 text-slate-500 hover:text-rose-400"
                               >
-                                <Trash2 className="w-4 h-4" />
+                                <Trash2 className="w-4 h-4" aria-hidden="true" />
                               </button>
                             </div>
                           )}
@@ -2364,7 +2852,7 @@ export default function App() {
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2.5">
-                  <User className="w-5 h-5 text-emerald-400" />
+                  <User className="w-5 h-5 text-emerald-400" aria-hidden="true" />
                   <div>
                     <h2 className="text-base font-bold text-white">Minha Conta</h2>
                     <p className="text-xs text-slate-400">
@@ -2379,14 +2867,35 @@ export default function App() {
                       : 'bg-slate-800 border-slate-700 text-slate-400'
                   }`}
                 >
-                  <Cloud className="w-3.5 h-3.5" />
+                  <Cloud className="w-3.5 h-3.5" aria-hidden="true" />
                   {userEmail ? 'Nuvem Ativa' : 'Modo Local'}
                 </span>
               </div>
 
+              {!isSbConfigured && (
+                <div
+                  role="alert"
+                  className="p-3 rounded-xl bg-amber-950/50 border border-amber-500/40 text-xs text-amber-200 flex items-center gap-2"
+                >
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
+                  <span>
+                    Sincronização em nuvem desativada neste ambiente. O app continua funcionando normalmente em modo local.
+                  </span>
+                </div>
+              )}
+
               {authStatus && (
-                <div className="p-3 rounded-xl bg-slate-950 border border-emerald-500/40 text-xs text-emerald-300">
-                  {authStatus}
+                <div
+                  role={authStatus.kind === 'error' || authStatus.kind === 'warning' ? 'alert' : 'status'}
+                  className={`p-3 rounded-xl border text-xs flex items-center gap-2 ${authStatusClasses[authStatus.kind]}`}
+                >
+                  {(authStatus.kind === 'error' || authStatus.kind === 'warning') && (
+                    <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
+                  )}
+                  {authStatus.kind === 'success' && (
+                    <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
+                  )}
+                  <span>{authStatus.text}</span>
                 </div>
               )}
 
@@ -2399,27 +2908,30 @@ export default function App() {
                       <span className="text-sm font-bold text-emerald-400">{userEmail}</span>
                     </div>
                     <button
+                      type="button"
                       onClick={handleLogout}
                       className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2 rounded-lg transition"
                     >
-                      <LogOut className="w-3.5 h-3.5" /> Sair
+                      <LogOut className="w-3.5 h-3.5" aria-hidden="true" /> Sair
                     </button>
                   </div>
 
                   <div className="flex flex-wrap gap-2 pt-2">
                     <button
+                      type="button"
                       disabled={syncing}
                       onClick={pushAllToSupabase}
-                      className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition"
+                      className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition"
                     >
-                      <UploadCloud className="w-4 h-4" />
+                      <UploadCloud className="w-4 h-4" aria-hidden="true" />
                       {syncing ? 'Sincronizando...' : 'Sincronizar Dados com a Nuvem'}
                     </button>
 
                     <button
+                      type="button"
                       disabled={syncing}
                       onClick={() => userId && pullFromSupabase(userId)}
-                      className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs px-4 py-2.5 rounded-xl transition"
+                      className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 font-semibold text-xs px-4 py-2.5 rounded-xl transition"
                     >
                       Baixar Dados da Nuvem
                     </button>
@@ -2433,12 +2945,15 @@ export default function App() {
                 >
                   <div className="flex items-center justify-between">
                     <h3 className="text-sm font-bold text-white flex items-center gap-1.5">
-                      <LogIn className="w-4 h-4 text-emerald-400" />
+                      <LogIn className="w-4 h-4 text-emerald-400" aria-hidden="true" />
                       {authMode === 'login' ? 'Entrar na sua Conta' : 'Criar Nova Conta'}
                     </h3>
                     <button
                       type="button"
-                      onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}
+                      onClick={() => {
+                        setAuthMode(authMode === 'login' ? 'signup' : 'login');
+                        setAuthStatus(null);
+                      }}
                       className="text-xs text-emerald-400 hover:underline"
                     >
                       {authMode === 'login'
@@ -2448,29 +2963,43 @@ export default function App() {
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <input
-                      type="email"
-                      required
-                      placeholder="Seu e-mail"
-                      value={authEmailInput}
-                      onChange={(e) => setAuthEmailInput(e.target.value)}
-                      className="bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white outline-none"
-                    />
-                    <input
-                      type="password"
-                      required
-                      minLength={6}
-                      placeholder="Sua senha (mín. 6 dígitos)"
-                      value={authPasswordInput}
-                      onChange={(e) => setAuthPasswordInput(e.target.value)}
-                      className="bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white outline-none"
-                    />
+                    <div>
+                      <label htmlFor="auth-email" className="block text-[11px] text-slate-400 mb-1">
+                        E-mail
+                      </label>
+                      <input
+                        id="auth-email"
+                        type="email"
+                        autoComplete="email"
+                        required
+                        placeholder="Seu e-mail"
+                        value={authEmailInput}
+                        onChange={(e) => setAuthEmailInput(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="auth-password" className="block text-[11px] text-slate-400 mb-1">
+                        Senha
+                      </label>
+                      <input
+                        id="auth-password"
+                        type="password"
+                        autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
+                        required
+                        minLength={authMode === 'signup' ? 8 : 6}
+                        placeholder={authMode === 'signup' ? 'Sua senha (mín. 8 caracteres)' : 'Sua senha'}
+                        value={authPasswordInput}
+                        onChange={(e) => setAuthPasswordInput(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white outline-none"
+                      />
+                    </div>
                   </div>
 
                   <button
                     type="submit"
-                    disabled={syncing}
-                    className="w-full sm:w-auto px-6 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-xl transition"
+                    disabled={syncing || !isSbConfigured}
+                    className="w-full sm:w-auto px-6 py-2.5 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-bold text-sm rounded-xl transition"
                   >
                     {syncing
                       ? 'Aguarde...'
@@ -2551,7 +3080,7 @@ export default function App() {
                   onClick={handleExportBackup}
                   className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-2 rounded-lg border border-slate-700 transition"
                 >
-                  <Download className="w-3.5 h-3.5" />
+                  <Download className="w-3.5 h-3.5" aria-hidden="true" />
                   Exportar Backup (.json)
                 </button>
               </div>
@@ -2561,55 +3090,68 @@ export default function App() {
       </main>
 
       {/* Navegação Inferior Fixa (Mobile-First) */}
-      <nav className="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur border-t border-slate-800">
+      <nav
+        aria-label="Navegação principal"
+        className="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur border-t border-slate-800"
+      >
         <div className="max-w-3xl mx-auto grid grid-cols-5">
           <button
+            type="button"
+            aria-current={activeTab === 'lancar' ? 'page' : undefined}
             onClick={() => setActiveTab('lancar')}
             className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold transition ${
               activeTab === 'lancar' ? 'text-emerald-400' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            <PlusCircle className="w-5 h-5" />
+            <PlusCircle className="w-5 h-5" aria-hidden="true" />
             <span>Lançar Dia</span>
           </button>
 
           <button
+            type="button"
+            aria-current={activeTab === 'historico' ? 'page' : undefined}
             onClick={() => setActiveTab('historico')}
             className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold transition ${
               activeTab === 'historico' ? 'text-emerald-400' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            <History className="w-5 h-5" />
+            <History className="w-5 h-5" aria-hidden="true" />
             <span>Histórico</span>
           </button>
 
           <button
+            type="button"
+            aria-current={activeTab === 'custos' ? 'page' : undefined}
             onClick={() => setActiveTab('custos')}
             className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold transition ${
               activeTab === 'custos' ? 'text-emerald-400' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            <Wrench className="w-5 h-5" />
+            <Wrench className="w-5 h-5" aria-hidden="true" />
             <span>Custo/KM</span>
           </button>
 
           <button
+            type="button"
+            aria-current={activeTab === 'imprevistos' ? 'page' : undefined}
             onClick={() => setActiveTab('imprevistos')}
             className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold transition ${
               activeTab === 'imprevistos' ? 'text-emerald-400' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            <AlertTriangle className="w-5 h-5" />
+            <AlertTriangle className="w-5 h-5" aria-hidden="true" />
             <span>Imprevistos</span>
           </button>
 
           <button
+            type="button"
+            aria-current={activeTab === 'nuvem' ? 'page' : undefined}
             onClick={() => setActiveTab('nuvem')}
             className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold transition ${
               activeTab === 'nuvem' ? 'text-emerald-400' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            <User className="w-5 h-5" />
+            <User className="w-5 h-5" aria-hidden="true" />
             <span>Minha Conta</span>
           </button>
         </div>

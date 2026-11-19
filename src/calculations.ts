@@ -14,6 +14,14 @@ export function generateUuid(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0;
     const v = c === 'x' ? r : (r & 0x3) | 0x8;
@@ -21,20 +29,9 @@ export function generateUuid(): string {
   });
 }
 
-export function ensureValidUuid(id: string): string {
-  if (UUID_REGEX.test(id)) return id;
-  // Converte IDs legados (ex: "seed-1", "maint-1") em um UUID determinístico válido para o PostgreSQL
-  let hash = 0;
-  for (let i = 0; i < id.length; i++) {
-    hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
-  }
-  const hex = hash.toString(16).padStart(8, '0');
-  const suffix = Array.from(id)
-    .map((ch) => ch.charCodeAt(0).toString(16).padStart(2, '0'))
-    .join('')
-    .padEnd(12, '0')
-    .slice(0, 12);
-  return `${hex}-0000-4000-8000-${suffix}`;
+export function ensureValidUuid(id?: string | null): string {
+  if (id && UUID_REGEX.test(id)) return id;
+  return generateUuid();
 }
 
 export function sortDailyLogsDesc(logs: DailyLog[]): DailyLog[] {
@@ -89,6 +86,21 @@ export interface DayMetrics {
   netPerHour: number;
 }
 
+export interface PeriodSummaryStats {
+  daysCount: number;
+  totalGross: number;
+  totalKm: number;
+  totalHours: number;
+  totalFuel: number;
+  totalMaint: number;
+  totalUnexpected: number;
+  totalCost: number;
+  netProfit: number;
+  avgGrossPerKm: number;
+  avgNetPerKm: number;
+  avgGrossPerHour: number;
+}
+
 export function calculateDayMetrics(
   log: DailyLog,
   settings: BikeSettings,
@@ -133,6 +145,58 @@ export function calculateDayMetrics(
     netProfit,
     netPerKm,
     netPerHour,
+  };
+}
+
+export function calculatePeriodSummary(
+  logs: DailyLog[],
+  settings: BikeSettings,
+  maintenanceItems: MaintenanceItem[],
+  unexpectedExpenses: UnexpectedExpense[],
+  selectedMonth: string = 'all'
+): PeriodSummaryStats {
+  let totalGross = 0;
+  let totalGrossWithValidHours = 0;
+  let totalKm = 0;
+  let totalHours = 0;
+  let totalFuel = 0;
+  let totalMaint = 0;
+
+  logs.forEach((l) => {
+    const m = calculateDayMetrics(l, settings, maintenanceItems, []);
+    totalGross += m.grossEarnings;
+    totalKm += m.kmRodado;
+    totalHours += m.hoursWorked;
+    if (m.hoursWorked > 0) {
+      totalGrossWithValidHours += m.grossEarnings;
+    }
+    totalFuel += m.fuelCost;
+    totalMaint += m.maintenanceCost;
+  });
+
+  const totalUnexpected = unexpectedExpenses
+    .filter((u) => selectedMonth === 'all' || u.expense_date.startsWith(selectedMonth))
+    .reduce((acc, cur) => acc + cur.amount, 0);
+
+  const totalCost = totalFuel + totalMaint + totalUnexpected;
+  const netProfit = totalGross - totalCost;
+  const avgGrossPerKm = totalKm > 0 ? totalGross / totalKm : 0;
+  const avgNetPerKm = totalKm > 0 ? netProfit / totalKm : 0;
+  const avgGrossPerHour = totalHours > 0 ? totalGrossWithValidHours / totalHours : 0;
+
+  return {
+    daysCount: logs.length,
+    totalGross,
+    totalKm,
+    totalHours,
+    totalFuel,
+    totalMaint,
+    totalUnexpected,
+    totalCost,
+    netProfit,
+    avgGrossPerKm,
+    avgNetPerKm,
+    avgGrossPerHour,
   };
 }
 
