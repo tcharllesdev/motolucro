@@ -25,6 +25,7 @@ import {
   ExternalLink,
   RefreshCw,
   Unlink,
+  CloudOff,
 } from 'lucide-react';
 import { BikeSettings, MaintenanceItem, DailyLog, UnexpectedExpense, TelegramLink } from './types';
 import {
@@ -54,11 +55,28 @@ import { getSupabaseClient, getSupabaseCredentials } from './supabaseClient';
 import { evaluateEarningsExpression, formatEarningsInputValue } from './earningsExpression';
 import { EarningsInput } from './components/EarningsInput';
 import { DateInput } from './components/DateInput';
-
-const LS_SETTINGS_KEY = 'motolucro_bike_settings_v1';
-const LS_MAINT_KEY = 'motolucro_maint_items_v1';
-const LS_LOGS_KEY = 'motolucro_daily_logs_v1';
-const LS_UNEXPECTED_KEY = 'motolucro_unexpected_v1';
+import {
+  LS_SETTINGS_KEY,
+  LS_MAINT_KEY,
+  LS_LOGS_KEY,
+  LS_UNEXPECTED_KEY,
+  PendingSyncState,
+  createEmptyPendingSyncState,
+  initializePendingSyncState,
+  savePendingSyncState,
+  clearPendingSyncState,
+  hasPendingSyncChanges,
+  countPendingSyncChanges,
+  markSettingsDirty,
+  clearSettingsDirty,
+  markItemUpsert,
+  clearItemUpsert,
+  markItemDelete,
+  clearItemDelete,
+  setPendingUserId,
+  detectChangesAgainstDemo,
+  mergePendingDataWithRemote,
+} from './syncState';
 const LS_LEGACY_SUPABASE_URL_KEY = 'motolucro_supabase_url';
 const LS_LEGACY_SUPABASE_ANON_KEY = 'motolucro_supabase_anon_key';
 const DEFAULT_START_TIME = '09:40';
@@ -218,6 +236,33 @@ export default function App() {
       return createDemoUnexpectedExpenses();
     }
   });
+
+  // Estado persistido de alterações locais ainda não sincronizadas com a nuvem
+  const [pendingSync, setPendingSync] = useState<PendingSyncState>(() =>
+    initializePendingSyncState(typeof localStorage !== 'undefined' ? localStorage : null, {
+      settings,
+      maintenanceItems,
+      dailyLogs,
+      unexpectedExpenses,
+    })
+  );
+  const pendingSyncRef = useRef<PendingSyncState>(pendingSync);
+
+  function applyPendingSyncUpdate(
+    updater: (prev: PendingSyncState) => PendingSyncState,
+    persist = true
+  ): PendingSyncState {
+    const next = updater(pendingSyncRef.current);
+    pendingSyncRef.current = next;
+    setPendingSync(next);
+    if (persist) {
+      savePendingSyncState(next);
+    }
+    return next;
+  }
+
+  const pendingCount = useMemo(() => countPendingSyncChanges(pendingSync), [pendingSync]);
+  const hasPendingLocalChanges = pendingCount > 0;
 
   // Lista sempre ordenada da data mais recente para a mais antiga
   const sortedDailyLogs = useMemo(() => sortDailyLogsDesc(dailyLogs), [dailyLogs]);
@@ -405,11 +450,14 @@ export default function App() {
         updated_at: new Date().toISOString(),
       });
       if (error) {
+        applyPendingSyncUpdate((prev) => markSettingsDirty(prev, userId));
         setCloudErrorBanner(`Erro ao salvar configurações na nuvem: ${error.message}`);
       } else {
+        applyPendingSyncUpdate((prev) => clearSettingsDirty(prev));
         setCloudErrorBanner('');
       }
     } catch (err) {
+      applyPendingSyncUpdate((prev) => markSettingsDirty(prev, userId));
       setCloudErrorBanner(`Erro ao salvar configurações na nuvem: ${getErrorMessage(err)}`);
     }
   }
@@ -570,12 +618,25 @@ export default function App() {
     }
   }
 
-  async function pullFromSupabase(uid: string) {
+  async function pullFromSupabase(uid: string, forceOverwriteFromRemote = false) {
     const client = getSupabaseClient();
     if (!client) return;
     setSyncing(true);
     setCloudErrorBanner('');
     try {
+      const currentPending = pendingSyncRef.current;
+      const hasPending = hasPendingSyncChanges(currentPending);
+
+      // Se existem alterações locais pertencentes a esta conta, não sobrescreve no pull automático
+      if (!forceOverwriteFromRemote && hasPending && currentPending.pendingUserId === uid) {
+        await fetchTelegramLinkStatus(uid, true);
+        setAuthStatus({
+          kind: 'warning',
+          text: 'Você possui alterações salvas apenas neste aparelho. Clique em "Subir para nuvem" para sincronizá-las.',
+        });
+        return;
+      }
+
       const [settingsRes, maintRes, logsRes, unexpRes] = await Promise.all([
         client.from('bike_settings').select('*').eq('user_id', uid).maybeSingle(),
         client.from('maintenance_items').select('*').eq('user_id', uid).order('created_at'),
@@ -603,66 +664,147 @@ export default function App() {
         (unexpRes.data && unexpRes.data.length > 0);
 
       if (!hasRemoteData) {
+        applyPendingSyncUpdate((prev) => {
+          if (hasPendingSyncChanges(prev)) {
+            return setPendingUserId(prev, uid);
+          }
+          const diffFromDemo = detectChangesAgainstDemo(
+            {
+              settings,
+              maintenanceItems,
+              dailyLogs,
+              unexpectedExpenses,
+            },
+            uid
+          );
+          return hasPendingSyncChanges(diffFromDemo) ? diffFromDemo : prev;
+        });
         setAuthStatus({
           kind: 'info',
-          text: 'Conta conectada! Nenhum dado salvo na nuvem ainda — clique em "Sincronizar Dados com a Nuvem" para enviar seu histórico.',
+          text: 'Conta conectada! Nenhum dado salvo na nuvem ainda — clique em "Subir para nuvem" para enviar seus dados.',
         });
         return;
       }
 
-      if (settingsRes.data) {
-        const nextSettings: BikeSettings = {
-          bike_name: settingsRes.data.bike_name,
-          fuel_consumption_km_l: Number(settingsRes.data.fuel_consumption_km_l),
-          fuel_price_per_liter: Number(settingsRes.data.fuel_price_per_liter),
-        };
-        setSettings(nextSettings);
-        setFuelConsumptionInput(String(nextSettings.fuel_consumption_km_l));
-        setFuelPriceInput(String(nextSettings.fuel_price_per_liter));
-      }
+      const remoteSettings: BikeSettings | null = settingsRes.data
+        ? {
+            bike_name: settingsRes.data.bike_name,
+            fuel_consumption_km_l: Number(settingsRes.data.fuel_consumption_km_l),
+            fuel_price_per_liter: Number(settingsRes.data.fuel_price_per_liter),
+          }
+        : null;
 
-      if (maintRes.data) {
-        setMaintenanceItems(
-          maintRes.data.map((m: Record<string, unknown>) => ({
+      const remoteMaint: MaintenanceItem[] = maintRes.data
+        ? maintRes.data.map((m: Record<string, unknown>) => ({
             id: String(m.id),
             name: String(m.name),
             cost: Number(m.cost),
             duration_km: Number(m.duration_km),
           }))
-        );
-      }
+        : [];
 
-      if (logsRes.data) {
-        const mappedLogs = sortDailyLogsDesc(
-          logsRes.data.map((l: Record<string, unknown>) => ({
-            id: String(l.id),
-            log_date: String(l.log_date),
-            earnings: Number(l.earnings),
-            km_start: Number(l.km_start),
-            km_end: Number(l.km_end),
-            km_total: Number(l.km_total),
-            start_time: typeof l.start_time === 'string' ? l.start_time : '',
-            end_time: typeof l.end_time === 'string' ? l.end_time : '',
-            notes: typeof l.notes === 'string' ? l.notes : '',
-          }))
-        );
-        setDailyLogs(mappedLogs);
-        if (!editingMainLogId && !kmEnd && !earnings && mappedLogs.length > 0 && mappedLogs[0].km_end > 0) {
-          setKmStart(String(mappedLogs[0].km_end));
-        }
-      }
+      const remoteLogs: DailyLog[] = logsRes.data
+        ? sortDailyLogsDesc(
+            logsRes.data.map((l: Record<string, unknown>) => ({
+              id: String(l.id),
+              log_date: String(l.log_date),
+              earnings: Number(l.earnings),
+              km_start: Number(l.km_start),
+              km_end: Number(l.km_end),
+              km_total: Number(l.km_total),
+              start_time: typeof l.start_time === 'string' ? l.start_time : '',
+              end_time: typeof l.end_time === 'string' ? l.end_time : '',
+              notes: typeof l.notes === 'string' ? l.notes : '',
+            }))
+          )
+        : [];
 
-      if (unexpRes.data) {
-        setUnexpectedExpenses(
-          unexpRes.data.map((u: Record<string, unknown>) => ({
+      const remoteUnexp: UnexpectedExpense[] = unexpRes.data
+        ? unexpRes.data.map((u: Record<string, unknown>) => ({
             id: String(u.id),
             expense_date: String(u.expense_date),
             description: String(u.description),
             amount: Number(u.amount),
           }))
+        : [];
+
+      const shouldMergeOfflineChanges =
+        !forceOverwriteFromRemote &&
+        hasPending &&
+        currentPending.pendingUserId === null;
+
+      if (shouldMergeOfflineChanges) {
+        const merged = mergePendingDataWithRemote(
+          {
+            settings,
+            maintenanceItems,
+            dailyLogs,
+            unexpectedExpenses,
+          },
+          {
+            settings: remoteSettings,
+            maintenanceItems: remoteMaint,
+            dailyLogs: remoteLogs,
+            unexpectedExpenses: remoteUnexp,
+          },
+          currentPending,
+          uid
         );
+
+        setSettings(merged.settings);
+        setFuelConsumptionInput(String(merged.settings.fuel_consumption_km_l));
+        setFuelPriceInput(String(merged.settings.fuel_price_per_liter));
+        setMaintenanceItems(merged.maintenanceItems);
+        setDailyLogs(merged.dailyLogs);
+        if (
+          !editingMainLogId &&
+          !kmEnd &&
+          !earnings &&
+          merged.dailyLogs.length > 0 &&
+          merged.dailyLogs[0].km_end > 0
+        ) {
+          setKmStart(String(merged.dailyLogs[0].km_end));
+        }
+        setUnexpectedExpenses(merged.unexpectedExpenses);
+
+        if (hasPendingSyncChanges(merged.pendingSync)) {
+          applyPendingSyncUpdate(() => merged.pendingSync);
+          setAuthStatus({
+            kind: 'warning',
+            text: 'Dados da nuvem carregados preservando suas alterações locais. Clique em "Subir para nuvem" para enviar tudo.',
+          });
+        } else {
+          applyPendingSyncUpdate(() => clearPendingSyncState(), false);
+          setAuthStatus({
+            kind: 'success',
+            text: 'Dados sincronizados da nuvem Supabase com sucesso!',
+          });
+        }
+        return;
       }
 
+      if (remoteSettings) {
+        setSettings(remoteSettings);
+        setFuelConsumptionInput(String(remoteSettings.fuel_consumption_km_l));
+        setFuelPriceInput(String(remoteSettings.fuel_price_per_liter));
+      }
+
+      if (maintRes.data) {
+        setMaintenanceItems(remoteMaint);
+      }
+
+      if (logsRes.data) {
+        setDailyLogs(remoteLogs);
+        if (!editingMainLogId && !kmEnd && !earnings && remoteLogs.length > 0 && remoteLogs[0].km_end > 0) {
+          setKmStart(String(remoteLogs[0].km_end));
+        }
+      }
+
+      if (unexpRes.data) {
+        setUnexpectedExpenses(remoteUnexp);
+      }
+
+      applyPendingSyncUpdate(() => clearPendingSyncState(), false);
       setAuthStatus({
         kind: 'success',
         text: 'Dados sincronizados da nuvem Supabase com sucesso!',
@@ -687,6 +829,36 @@ export default function App() {
     });
     setCloudErrorBanner('');
     try {
+      const pending = pendingSyncRef.current;
+
+      // 0. Executa exclusões pendentes antes dos upserts
+      if (pending.deleteMaintIds.length > 0) {
+        const { error: maintDelErr } = await client
+          .from('maintenance_items')
+          .delete()
+          .eq('user_id', userId)
+          .in('id', pending.deleteMaintIds.map((id) => ensureValidUuid(id)));
+        if (maintDelErr) throw new Error(`Exclusão de peças: ${maintDelErr.message}`);
+      }
+
+      if (pending.deleteLogIds.length > 0) {
+        const { error: logsDelErr } = await client
+          .from('daily_logs')
+          .delete()
+          .eq('user_id', userId)
+          .in('id', pending.deleteLogIds.map((id) => ensureValidUuid(id)));
+        if (logsDelErr) throw new Error(`Exclusão de diário: ${logsDelErr.message}`);
+      }
+
+      if (pending.deleteUnexpIds.length > 0) {
+        const { error: unexpDelErr } = await client
+          .from('unexpected_expenses')
+          .delete()
+          .eq('user_id', userId)
+          .in('id', pending.deleteUnexpIds.map((id) => ensureValidUuid(id)));
+        if (unexpDelErr) throw new Error(`Exclusão de imprevistos: ${unexpDelErr.message}`);
+      }
+
       // 1. Upsert bike_settings
       const { error: settingsErr } = await client.from('bike_settings').upsert({
         user_id: userId,
@@ -759,16 +931,19 @@ export default function App() {
         if (unexpUpsertErr) throw new Error(`Imprevistos: ${unexpUpsertErr.message}`);
       }
 
-      await pullFromSupabase(userId);
+      applyPendingSyncUpdate(() => clearPendingSyncState(), false);
+      await pullFromSupabase(userId, true);
       setAuthStatus({
         kind: 'success',
         text: 'Todos os dados locais foram salvos com segurança no Supabase!',
       });
     } catch (err) {
+      const msg = `Falha ao sincronizar: ${getErrorMessage(err)}`;
       setAuthStatus({
         kind: 'error',
-        text: `Falha ao sincronizar: ${getErrorMessage(err)}`,
+        text: msg,
       });
+      setCloudErrorBanner(msg);
     } finally {
       setSyncing(false);
     }
@@ -847,6 +1022,9 @@ export default function App() {
       setDailyLogs((prev) =>
         sortDailyLogsDesc([normalizedLog, ...prev.filter((i) => i.id !== log.id && i.id !== normalizedLog.id)])
       );
+      applyPendingSyncUpdate((prev) =>
+        markItemUpsert(clearItemDelete(prev, 'log', normalizedLog.id), 'log', normalizedLog.id, userId)
+      );
       if (client && userId) {
         try {
           const { error } = await client.from('daily_logs').upsert(
@@ -865,6 +1043,7 @@ export default function App() {
             { onConflict: 'id' }
           );
           if (error) throw error;
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'log', normalizedLog.id));
           setCloudErrorBanner('');
         } catch (err) {
           setCloudErrorBanner(
@@ -879,6 +1058,9 @@ export default function App() {
         ...prev.filter((i) => i.id !== item.id && i.id !== normalizedItem.id),
         normalizedItem,
       ]);
+      applyPendingSyncUpdate((prev) =>
+        markItemUpsert(clearItemDelete(prev, 'maint', normalizedItem.id), 'maint', normalizedItem.id, userId)
+      );
       if (client && userId) {
         try {
           const { error } = await client.from('maintenance_items').upsert(
@@ -892,6 +1074,7 @@ export default function App() {
             { onConflict: 'id' }
           );
           if (error) throw error;
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'maint', normalizedItem.id));
           setCloudErrorBanner('');
         } catch (err) {
           setCloudErrorBanner(
@@ -906,6 +1089,9 @@ export default function App() {
         normalizedExp,
         ...prev.filter((i) => i.id !== exp.id && i.id !== normalizedExp.id),
       ]);
+      applyPendingSyncUpdate((prev) =>
+        markItemUpsert(clearItemDelete(prev, 'unexp', normalizedExp.id), 'unexp', normalizedExp.id, userId)
+      );
       if (client && userId) {
         try {
           const { error } = await client.from('unexpected_expenses').upsert(
@@ -919,6 +1105,7 @@ export default function App() {
             { onConflict: 'id' }
           );
           if (error) throw error;
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'unexp', normalizedExp.id));
           setCloudErrorBanner('');
         } catch (err) {
           setCloudErrorBanner(
@@ -1022,6 +1209,7 @@ export default function App() {
       ),
     ]);
     setDailyLogs(updated);
+    applyPendingSyncUpdate((prev) => markItemUpsert(prev, 'log', savedLog.id, userId));
 
     const wasEditing = Boolean(targetId);
     setEditingMainLogId(null);
@@ -1063,6 +1251,7 @@ export default function App() {
         if (error) {
           setCloudErrorBanner(`Salvo no aparelho, mas falhou na nuvem: ${error.message}`);
         } else {
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'log', savedLog.id));
           setCloudErrorBanner('');
         }
       } catch (err) {
@@ -1117,6 +1306,7 @@ export default function App() {
       dailyLogs.map((item) => (item.id === originalLog.id ? updatedLog : item))
     );
     setDailyLogs(nextLogs);
+    applyPendingSyncUpdate((prev) => markItemUpsert(prev, 'log', updatedLog.id, userId));
     setHistEditId(null);
 
     if (!editingMainLogId && !kmEnd && !earnings && nextLogs.length > 0 && nextLogs[0].km_end > 0) {
@@ -1144,6 +1334,7 @@ export default function App() {
         if (error) {
           setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
         } else {
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'log', updatedLog.id));
           setCloudErrorBanner('');
         }
       } catch (err) {
@@ -1153,7 +1344,9 @@ export default function App() {
   }
 
   async function handleDeleteLog(log: DailyLog) {
+    const normalizedId = ensureValidUuid(log.id);
     setDailyLogs((prev) => prev.filter((item) => item.id !== log.id));
+    applyPendingSyncUpdate((prev) => markItemDelete(prev, 'log', normalizedId, userId));
     setConfirmDeleteId(null);
     triggerUndoBanner({
       kind: 'log',
@@ -1167,9 +1360,10 @@ export default function App() {
         const { error } = await client
           .from('daily_logs')
           .delete()
-          .eq('id', ensureValidUuid(log.id))
+          .eq('id', normalizedId)
           .eq('user_id', userId);
         if (error) throw error;
+        applyPendingSyncUpdate((prev) => clearItemDelete(prev, 'log', normalizedId));
         setCloudErrorBanner('');
       } catch (err) {
         setCloudErrorBanner(
@@ -1203,6 +1397,7 @@ export default function App() {
     };
 
     setMaintenanceItems((prev) => [...prev, item]);
+    applyPendingSyncUpdate((prev) => markItemUpsert(prev, 'maint', item.id, userId));
     setNewMaintName('');
     setNewMaintCost('');
     setNewMaintDuration('');
@@ -1223,6 +1418,7 @@ export default function App() {
         if (error) {
           setCloudErrorBanner(`Peça salva no aparelho, mas falhou na nuvem: ${error.message}`);
         } else {
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'maint', item.id));
           setCloudErrorBanner('');
         }
       } catch (err) {
@@ -1258,6 +1454,7 @@ export default function App() {
     };
 
     setMaintenanceItems((prev) => prev.map((i) => (i.id === original.id ? updated : i)));
+    applyPendingSyncUpdate((prev) => markItemUpsert(prev, 'maint', updated.id, userId));
     setMaintEditId(null);
 
     const client = getSupabaseClient();
@@ -1276,6 +1473,7 @@ export default function App() {
         if (error) {
           setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
         } else {
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'maint', updated.id));
           setCloudErrorBanner('');
         }
       } catch (err) {
@@ -1285,7 +1483,9 @@ export default function App() {
   }
 
   async function handleDeleteMaintenanceItem(item: MaintenanceItem) {
+    const normalizedId = ensureValidUuid(item.id);
     setMaintenanceItems((prev) => prev.filter((i) => i.id !== item.id));
+    applyPendingSyncUpdate((prev) => markItemDelete(prev, 'maint', normalizedId, userId));
     setConfirmDeleteId(null);
     triggerUndoBanner({
       kind: 'maint',
@@ -1299,9 +1499,10 @@ export default function App() {
         const { error } = await client
           .from('maintenance_items')
           .delete()
-          .eq('id', ensureValidUuid(item.id))
+          .eq('id', normalizedId)
           .eq('user_id', userId);
         if (error) throw error;
+        applyPendingSyncUpdate((prev) => clearItemDelete(prev, 'maint', normalizedId));
         setCloudErrorBanner('');
       } catch (err) {
         setCloudErrorBanner(
@@ -1334,6 +1535,7 @@ export default function App() {
     };
 
     setUnexpectedExpenses((prev) => [exp, ...prev]);
+    applyPendingSyncUpdate((prev) => markItemUpsert(prev, 'unexp', exp.id, userId));
     setUnexpDesc('');
     setUnexpAmount('');
 
@@ -1353,6 +1555,7 @@ export default function App() {
         if (error) {
           setCloudErrorBanner(`Imprevisto salvo no aparelho, mas falhou na nuvem: ${error.message}`);
         } else {
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'unexp', exp.id));
           setCloudErrorBanner('');
         }
       } catch (err) {
@@ -1387,6 +1590,7 @@ export default function App() {
     };
 
     setUnexpectedExpenses((prev) => prev.map((u) => (u.id === original.id ? updated : u)));
+    applyPendingSyncUpdate((prev) => markItemUpsert(prev, 'unexp', updated.id, userId));
     setUnexpEditId(null);
 
     const client = getSupabaseClient();
@@ -1405,6 +1609,7 @@ export default function App() {
         if (error) {
           setCloudErrorBanner(`Edição salva no aparelho, mas falhou na nuvem: ${error.message}`);
         } else {
+          applyPendingSyncUpdate((prev) => clearItemUpsert(prev, 'unexp', updated.id));
           setCloudErrorBanner('');
         }
       } catch (err) {
@@ -1414,7 +1619,9 @@ export default function App() {
   }
 
   async function handleDeleteUnexpected(exp: UnexpectedExpense) {
+    const normalizedId = ensureValidUuid(exp.id);
     setUnexpectedExpenses((prev) => prev.filter((u) => u.id !== exp.id));
+    applyPendingSyncUpdate((prev) => markItemDelete(prev, 'unexp', normalizedId, userId));
     setConfirmDeleteId(null);
     triggerUndoBanner({
       kind: 'unexp',
@@ -1428,9 +1635,10 @@ export default function App() {
         const { error } = await client
           .from('unexpected_expenses')
           .delete()
-          .eq('id', ensureValidUuid(exp.id))
+          .eq('id', normalizedId)
           .eq('user_id', userId);
         if (error) throw error;
+        applyPendingSyncUpdate((prev) => clearItemDelete(prev, 'unexp', normalizedId));
         setCloudErrorBanner('');
       } catch (err) {
         setCloudErrorBanner(
@@ -1518,11 +1726,22 @@ export default function App() {
         });
         if (error) throw error;
         if (data.session?.user) {
+          const newUid = data.session.user.id;
           setUserEmail(data.session.user.email ?? 'Logado');
-          setUserId(data.session.user.id);
+          setUserId(newUid);
+          applyPendingSyncUpdate((prev) => {
+            if (hasPendingSyncChanges(prev)) {
+              return setPendingUserId(prev, newUid);
+            }
+            const diffFromDemo = detectChangesAgainstDemo(
+              { settings, maintenanceItems, dailyLogs, unexpectedExpenses },
+              newUid
+            );
+            return hasPendingSyncChanges(diffFromDemo) ? diffFromDemo : prev;
+          });
           setAuthStatus({
             kind: 'success',
-            text: 'Conta criada e conectada! Clique em "Sincronizar Dados com a Nuvem" para salvar seu histórico.',
+            text: 'Conta criada e conectada! Clique em "Subir para nuvem" para salvar seus dados.',
           });
         } else if (data.user) {
           setUserEmail(null);
@@ -1571,6 +1790,7 @@ export default function App() {
     localStorage.removeItem(LS_UNEXPECTED_KEY);
     localStorage.removeItem(LS_LEGACY_SUPABASE_URL_KEY);
     localStorage.removeItem(LS_LEGACY_SUPABASE_ANON_KEY);
+    applyPendingSyncUpdate(() => clearPendingSyncState(), false);
 
     // Impede os effects de regravarem os dados demo logo após a limpeza
     skipPersistRef.current = {
@@ -1669,6 +1889,19 @@ export default function App() {
     }
   }
 
+  function handleTopbarPushCta() {
+    if (userEmail && userId) {
+      void pushAllToSupabase();
+      return;
+    }
+    setActiveTab('nuvem');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    setAuthStatus({
+      kind: 'warning',
+      text: 'Entre ou crie sua conta abaixo para subir suas alterações locais para a nuvem.',
+    });
+  }
+
   function handleExportBackup() {
     const payload = {
       exportedAt: new Date().toISOString(),
@@ -1718,16 +1951,89 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab('nuvem')}
-            className={`shrink-0 flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border transition ${
-              userEmail
+            aria-label={
+              syncing
+                ? 'Sincronizando com a nuvem'
+                : hasPendingLocalChanges
+                ? `${pendingCount} ${pendingCount === 1 ? 'alteração pendente apenas no aparelho' : 'alterações pendentes apenas no aparelho'}. Abrir Minha Conta`
+                : userEmail
+                ? 'Dados sincronizados com a nuvem. Abrir Minha Conta'
+                : 'Abrir Minha Conta'
+            }
+            className={`shrink-0 flex items-center gap-1.5 text-xs font-medium px-2.5 sm:px-3 py-1.5 rounded-lg border transition ${
+              syncing
+                ? 'bg-sky-500/15 border-sky-500/40 text-sky-300'
+                : hasPendingLocalChanges
+                ? 'bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/20'
+                : userEmail
                 ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
                 : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-800'
             }`}
           >
-            <User className="w-3.5 h-3.5" aria-hidden="true" />
-            {userEmail ? 'Sincronizado' : 'Minha Conta'}
+            {syncing ? (
+              <>
+                <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" aria-hidden="true" />
+                <span>Sincronizando...</span>
+              </>
+            ) : hasPendingLocalChanges ? (
+              <>
+                <CloudOff className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>Local • {pendingCount}</span>
+              </>
+            ) : userEmail ? (
+              <>
+                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>Sincronizado</span>
+              </>
+            ) : (
+              <>
+                <User className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>Minha Conta</span>
+              </>
+            )}
           </button>
         </div>
+
+        {hasPendingLocalChanges && !syncing && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="max-w-3xl mx-auto border-t border-amber-500/20 pt-2 mt-2 flex items-center justify-between gap-2"
+          >
+            <div className="flex items-center gap-2 min-w-0 text-xs text-amber-200">
+              <span
+                className="w-2 h-2 rounded-full bg-amber-400 shrink-0 animate-pulse"
+                aria-hidden="true"
+              />
+              <span
+                className="truncate font-medium sm:hidden"
+                title={
+                  pendingCount === 1
+                    ? '1 alteração salva apenas neste aparelho (localStorage)'
+                    : `${pendingCount} alterações salvas apenas neste aparelho (localStorage)`
+                }
+              >
+                {pendingCount === 1
+                  ? '1 alteração no aparelho'
+                  : `${pendingCount} alterações no aparelho`}
+              </span>
+              <span className="truncate font-medium hidden sm:inline">
+                {pendingCount === 1
+                  ? '1 alteração salva apenas neste aparelho (localStorage)'
+                  : `${pendingCount} alterações salvas apenas neste aparelho (localStorage)`}
+              </span>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleTopbarPushCta}
+              className="shrink-0 flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 active:scale-[0.99] text-slate-950 shadow-sm transition"
+            >
+              <UploadCloud className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>Subir para nuvem</span>
+            </button>
+          </div>
+        )}
       </header>
 
       {/* Banner de Desfazer Exclusão (Undo) */}
@@ -2589,7 +2895,13 @@ export default function App() {
                     id="bike-name"
                     type="text"
                     value={settings.bike_name}
-                    onChange={(e) => setSettings({ ...settings, bike_name: e.target.value })}
+                    onChange={(e) => {
+                      const nextName = e.target.value;
+                      if (nextName !== settings.bike_name) {
+                        setSettings({ ...settings, bike_name: nextName });
+                        applyPendingSyncUpdate((prev) => markSettingsDirty(prev, userId));
+                      }
+                    }}
                     onBlur={() => syncSettingsToSupabase(settings)}
                     className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white outline-none"
                   />
@@ -2612,8 +2924,9 @@ export default function App() {
                       const raw = e.target.value;
                       setFuelConsumptionInput(raw);
                       const parsed = parseFloat(raw.replace(',', '.'));
-                      if (!isNaN(parsed) && parsed > 0) {
+                      if (!isNaN(parsed) && parsed > 0 && parsed !== settings.fuel_consumption_km_l) {
                         setSettings((prev) => ({ ...prev, fuel_consumption_km_l: parsed }));
+                        applyPendingSyncUpdate((prev) => markSettingsDirty(prev, userId));
                       }
                     }}
                     onBlur={() => {
@@ -2645,8 +2958,9 @@ export default function App() {
                       const raw = e.target.value;
                       setFuelPriceInput(raw);
                       const parsed = parseFloat(raw.replace(',', '.'));
-                      if (!isNaN(parsed) && parsed > 0) {
+                      if (!isNaN(parsed) && parsed > 0 && parsed !== settings.fuel_price_per_liter) {
                         setSettings((prev) => ({ ...prev, fuel_price_per_liter: parsed }));
+                        applyPendingSyncUpdate((prev) => markSettingsDirty(prev, userId));
                       }
                     }}
                     onBlur={() => {
@@ -3181,13 +3495,23 @@ export default function App() {
                 </div>
                 <span
                   className={`text-[11px] font-medium px-2.5 py-1 rounded-full border shrink-0 flex items-center gap-1.5 ${
-                    userEmail
+                    hasPendingLocalChanges
+                      ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                      : userEmail
                       ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
                       : 'bg-slate-800 border-slate-700 text-slate-400'
                   }`}
                 >
-                  <Cloud className="w-3.5 h-3.5" aria-hidden="true" />
-                  {userEmail ? 'Nuvem Ativa' : 'Modo Local'}
+                  {hasPendingLocalChanges ? (
+                    <CloudOff className="w-3.5 h-3.5" aria-hidden="true" />
+                  ) : (
+                    <Cloud className="w-3.5 h-3.5" aria-hidden="true" />
+                  )}
+                  {hasPendingLocalChanges
+                    ? `Pendências (${pendingCount})`
+                    : userEmail
+                    ? 'Nuvem Ativa'
+                    : 'Modo Local'}
                 </span>
               </div>
 
@@ -3249,7 +3573,7 @@ export default function App() {
                     <button
                       type="button"
                       disabled={syncing}
-                      onClick={() => userId && pullFromSupabase(userId)}
+                      onClick={() => userId && pullFromSupabase(userId, true)}
                       className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 font-semibold text-xs px-4 py-2.5 rounded-xl transition"
                     >
                       Baixar Dados da Nuvem
