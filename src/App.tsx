@@ -35,6 +35,8 @@ import {
   formatBRL,
   formatPerKm,
   formatDateBR,
+  getWeekdayName,
+  formatDateWithWeekday,
   getLocalTodayStr,
   generateUuid,
   ensureValidUuid,
@@ -1855,6 +1857,14 @@ export default function App() {
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-semibold text-sm text-white">
                             {formatDateBR(log.log_date)}
+                            {getWeekdayName(log.log_date) && (
+                              <>
+                                {' '}
+                                <span className="text-xs font-normal text-slate-400 lowercase">
+                                  ({getWeekdayName(log.log_date)})
+                                </span>
+                              </>
+                            )}
                           </span>
                           <span className="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-300">
                             {m.kmRodado.toFixed(1)} km ({log.km_start} → {log.km_end})
@@ -1894,7 +1904,7 @@ export default function App() {
                           type="button"
                           onClick={() => startEditInMainForm(log)}
                           title="Editar registro"
-                          aria-label={`Editar registro de ${formatDateBR(log.log_date)}`}
+                          aria-label={`Editar registro de ${formatDateWithWeekday(log.log_date)}`}
                           className="flex items-center gap-1 text-xs text-slate-300 hover:text-emerald-400 bg-slate-800/80 hover:bg-slate-800 border border-slate-700 px-2.5 py-1.5 rounded-lg transition"
                         >
                           <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
@@ -2033,7 +2043,7 @@ export default function App() {
                       >
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">
-                            Editando lançamento ({formatDateBR(log.log_date)})
+                            Editando lançamento ({formatDateWithWeekday(log.log_date)})
                           </span>
                           <button
                             type="button"
@@ -2183,6 +2193,14 @@ export default function App() {
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-bold text-sm text-white">
                             {formatDateBR(log.log_date)}
+                            {getWeekdayName(log.log_date) && (
+                              <>
+                                {' '}
+                                <span className="text-xs font-normal text-slate-400 lowercase">
+                                  ({getWeekdayName(log.log_date)})
+                                </span>
+                              </>
+                            )}
                           </span>
                           <span className="text-xs bg-slate-800 text-slate-300 px-2 py-0.5 rounded">
                             KM: {log.km_start} → {log.km_end} ({m.kmRodado.toFixed(1)} km)
@@ -2261,7 +2279,7 @@ export default function App() {
                               type="button"
                               onClick={() => startInlineHistoryEdit(log)}
                               title="Editar registro"
-                              aria-label={`Editar registro de ${formatDateBR(log.log_date)}`}
+                              aria-label={`Editar registro de ${formatDateWithWeekday(log.log_date)}`}
                               className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-300 hover:text-emerald-400 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700 transition"
                             >
                               <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
@@ -2271,7 +2289,7 @@ export default function App() {
                               type="button"
                               onClick={() => setConfirmDeleteId(log.id)}
                               title="Excluir registro"
-                              aria-label={`Excluir registro de ${formatDateBR(log.log_date)}`}
+                              aria-label={`Excluir registro de ${formatDateWithWeekday(log.log_date)}`}
                               className="p-2 text-slate-500 hover:text-rose-400 rounded-lg hover:bg-slate-800 transition"
                             >
                               <Trash2 className="w-4 h-4" aria-hidden="true" />
